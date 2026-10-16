@@ -35,7 +35,7 @@ DB_PATH = os.environ.get("DB_PATH", "taxi.db")
 
 # ---------- Tarif ----------
 PER_KM = float(os.environ.get("PER_KM", "0.66"))
-MIN_PRICE = float(os.environ.get("MIN_PRICE", "1.80"))
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "2.80"))
 PEAK_MULT = float(os.environ.get("PEAK_MULT", "1.3"))
 PEAK_HOURS = [(7 * 60 + 30, 10 * 60), (17 * 60, 20 * 60)]  # dəqiqə ilə
 TZ = ZoneInfo("Asia/Baku")
