@@ -3,6 +3,7 @@ import html
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -211,20 +212,41 @@ async def route_km(plat, plon, dlat, dlon):
         return None
 
 
-def pick_in_baku(features):
-    """Nəticələr arasından Bakı radiusuna düşən ilk ünvanı seçir."""
-    for f in features or []:
-        try:
-            lon, lat = f["geometry"]["coordinates"]
-        except Exception:
-            continue
-        if dist_km(BAKU_LAT, BAKU_LON, lat, lon) <= GEO_RADIUS_KM:
-            return lat, lon, f.get("properties", {}).get("label")
-    return None
+_TR = str.maketrans({
+    "ə": "e", "ı": "i", "ş": "s", "ç": "c", "ö": "o", "ü": "u", "ğ": "g",
+    "Ə": "e", "İ": "i", "Ş": "s", "Ç": "c", "Ö": "o", "Ü": "u", "Ğ": "g",
+})
+_SKIP = {"baku", "baki", "azerbaijan", "azerbaycan"}
+
+
+def norm(s) -> str:
+    """Azərbaycan hərflərini latın hərflərinə çevirib kiçildir (müqayisə üçün)."""
+    return str(s or "").translate(_TR).lower()
+
+
+def query_tokens(text: str):
+    return [t for t in re.split(r"\W+", norm(text)) if len(t) >= 2 and t not in _SKIP]
+
+
+def match_score(tokens, label: str) -> float:
+    """Sorğudakı sözlərin neçə faizi nəticənin adında var (1.0 = hamısı)."""
+    if not tokens:
+        return 0.0
+    nl = norm(label)
+
+    def hit(t):  # "bazarı" sorğusu "bazar" adını da tapsın (azərbaycanca şəkilçilər)
+        return t in nl or (len(t) >= 5 and (t[:-1] in nl or t[:-2] in nl))
+
+    return sum(1 for t in tokens if hit(t)) / len(tokens)
 
 
 async def geocode(text: str):
-    """Ünvanı koordinata çevirir; axtarış yalnız Bakı və ətrafı ilə məhdudlaşır."""
+    """Ünvanı axtarır; yalnız Bakı radiusundakı nəticələri qaytarır.
+    Hər nəticə: lat, lon, label, score (sözlərin uyğunluğu), baku (adında Bakı var).
+    Ən yaxşı uyğunluq birinci, ən çox 5 nəticə."""
+    toks = query_tokens(text)
+    found = {}
+    order = 0
     for q in (f"{text}, Baku, Azerbaijan", text):
         params = {
             "api_key": ORS_KEY,
@@ -242,11 +264,29 @@ async def geocode(text: str):
         except Exception:
             logging.exception("geocode error")
             continue
-        res = pick_in_baku(data.get("features"))
-        if res:
-            lat, lon, label = res
-            return lat, lon, label or text
-    return None
+        for f in data.get("features") or []:
+            try:
+                lon, lat = f["geometry"]["coordinates"]
+            except Exception:
+                continue
+            if dist_km(BAKU_LAT, BAKU_LON, lat, lon) > GEO_RADIUS_KM:
+                continue
+            key = (round(lat, 4), round(lon, 4))
+            if key in found:
+                continue
+            label = f.get("properties", {}).get("label") or text
+            nl = norm(label)
+            found[key] = {
+                "lat": lat, "lon": lon, "label": label,
+                "score": match_score(toks, label),
+                "baku": ("baku" in nl or "baki" in nl),
+                "order": order,
+            }
+            order += 1
+        if any(c["score"] >= 1 for c in found.values()):
+            break  # tam uyğun nəticə var, ikinci sorğuya ehtiyac yoxdur
+    cands = sorted(found.values(), key=lambda c: (-c["score"], not c["baku"], c["order"]))
+    return cands[:5]
 
 
 # ---------- Köməkçilər ----------
@@ -259,15 +299,14 @@ def waze(lat, lon) -> str:
 
 
 def order_text(o, road_km=None) -> str:
-    """Sürücüyə gedən mesaj. İki link heç vaxt alt-alta düşmür.
-    Fərdi mesajda: götürülmə yeri / məsafə / gediləcək yer / ödəniş.
-    Qrup mesajında (məsafə yoxdur): götürülmə yeri / ödəniş / gediləcək yer."""
-    pickup = f"<a href=\"{waze(o['plat'], o['plon'])}\">Götürülmə yeri</a>"
+    """Sürücüyə gedən mesaj: götürülmə yeri / ödəniş / gediləcək yer.
+    İki link heç vaxt alt-alta düşmür (aralarında ödəniş sətri var).
+    Fərdi mesajda götürülmə yerinin yanında mötərizədə yol məsafəsi yazılır."""
+    near = f" ({fmt_dist(road_km)})" if road_km is not None else ""
+    pickup = f"<a href=\"{waze(o['plat'], o['plon'])}\">Götürülmə yeri</a>{near}"
     dest = f"<a href=\"{waze(o['dlat'], o['dlon'])}\">Gediləcək yer</a>: {esc(o['dest_label'])}"
     pay = f"Ödəniş məbləği: {o['price']:.1f} ₼"
     head = f"<b>Sifariş #{o['id']}</b>"
-    if road_km is not None:
-        return "\n".join([head, pickup, f"Məsafə: {fmt_dist(road_km)}", dest, pay])
     return "\n".join([head, pickup, pay, dest])
 
 
@@ -365,15 +404,31 @@ async def on_text(m: Message):
     if not p or "dlat" in p:
         await m.answer("Əvvəlcə yerinizi göndərin 👇", reply_markup=start_kb())
         return
-    res = await geocode(m.text)
-    if not res:
+    cands = await geocode(m.text)
+    if not cands:
         await m.answer(
             "Bakı daxilində bu ünvanı tapa bilmədim. Daha dəqiq yazın "
             "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
         )
         return
-    lat, lon, label = res
-    await quote(m, p, lat, lon, label)
+    best = cands[0]
+    # Yalnız bir nəticə sözlərin hamısına uyğundursa, birbaşa qiymət göstər
+    if best["score"] >= 1 and (len(cands) == 1 or cands[1]["score"] < 1):
+        await quote(m, p, best["lat"], best["lon"], best["label"])
+        return
+    # Əks halda müştəri özü seçsin (yanlış yerə getməsin)
+    p["cands"] = cands
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{i + 1}. {c['label'][:55]}", callback_data=f"g:{i}")]
+            for i, c in enumerate(cands)
+        ]
+    )
+    note = (
+        "Bir neçə uyğun ünvan tapdım." if best["score"] >= 1
+        else "Dəqiq uyğunluq tapa bilmədim. Bunlardan biri sizin yerinizdir?"
+    )
+    await m.answer(f"{note}\nSeçin və ya 📎 → Yer ilə xəritədən nöqtə göndərin:", reply_markup=kb)
 
 
 async def quote(m: Message, p: dict, dlat, dlon, label):
@@ -394,6 +449,20 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
         f"🏁 Təyinat: {esc(label)}\n💰 Qiymət: <b>{price:.1f} ₼</b>{note}",
         reply_markup=kb,
     )
+
+
+@router.callback_query(F.data.startswith("g:"))
+async def pick_candidate(cb: CallbackQuery):
+    p = pending.get(cb.from_user.id)
+    try:
+        c = p["cands"][int(cb.data[2:])]
+    except Exception:
+        await cb.answer("Vaxt keçib. Ünvanı yenidən yazın.", show_alert=True)
+        return
+    p.pop("cands", None)
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await quote(cb.message, p, c["lat"], c["lon"], c["label"])
+    await cb.answer()
 
 
 @router.callback_query(F.data == "q_no")
