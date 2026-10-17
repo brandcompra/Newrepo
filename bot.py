@@ -52,8 +52,11 @@ if WEBAPP_URL and not WEBAPP_URL.startswith("http"):
 RADIUS_KM = float(os.environ.get("RADIUS_KM", "1.3"))
 LOC_MAX_AGE_MIN = int(os.environ.get("LOC_MAX_AGE_MIN", "12"))
 CANCEL_WARN = int(os.environ.get("CANCEL_WARN", "3"))           # 24 saatda bu qədər imtinadan sonra admin xəbərdar olunur
-BAKU_LAT, BAKU_LON = 40.4093, 49.8671
-GEO_RADIUS_KM = float(os.environ.get("GEO_RADIUS_KM", "25"))
+BAKU_LAT, BAKU_LON = 40.46866, 50.01917          # axtarış mərkəzi (Abşeron, Zabrat-Mərdəkan arası)
+GEO_RADIUS_KM = float(os.environ.get("GEO_RADIUS_KM", "35"))
+SUMGAIT_LAT, SUMGAIT_LON, SUMGAIT_ZONE_KM = 40.589, 49.669, 8.0   # bu dairədəki nəticələr atılır
+CITY_LAT, CITY_LON = 40.4093, 49.8671             # şəhər mərkəzi (yalnız yoxlama üçün)
+FAR_KM = float(os.environ.get("FAR_KM", "15"))    # bundan uzaq təyinatda müştəridən təsdiq istənilir
 
 # ---------- Tarif ----------
 PER_KM = float(os.environ.get("PER_KM", "0.2"))
@@ -128,6 +131,9 @@ def init_db():
             created TEXT,
             kind TEXT DEFAULT 'taxi', note TEXT,
             cust_msg_id INTEGER, drv_msg_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS places(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, lat REAL, lon REAL
         );
         CREATE TABLE IF NOT EXISTS customers(
             user_id INTEGER PRIMARY KEY, name TEXT, phone TEXT
@@ -401,7 +407,9 @@ _NOT_BAKU = ("sumqayit", "sumgait", "sumqayıt")
 def in_baku(props: dict, label: str) -> bool:
     """Sumqayıt və s. şəhərlərin nəticələrini atır (25 km radiusa sərhəd hissələri düşə bilir)."""
     blob = norm(" ".join(str(props.get(k, "")) for k in ("locality", "localadmin", "county", "macrocounty")) + " " + label)
-    return not any(norm(w) in blob for w in _NOT_BAKU)
+    if any(norm(w) in blob for w in _NOT_BAKU):
+        return False
+    return True
 
 
 async def _pelias(q: str, near=None):
@@ -435,6 +443,13 @@ def _collect(found: dict, features, toks, text, near=None):
         label = props.get("label") or text
         if not in_baku(props, label):
             continue
+        if dist_km(SUMGAIT_LAT, SUMGAIT_LON, lat, lon) < SUMGAIT_ZONE_KM:
+            continue
+        # rayon/şəhər göstərilməyən ("..., Azerbaijan") nəticə şəhərdən kənarda ola bilər: mərkəzdən 12 km-dən uzaqdırsa at
+        located = any(props.get(k) for k in ("locality", "localadmin", "county", "borough", "neighbourhood",
+                                              "macroregion", "region")) or "baku" in norm(label) or "baki" in norm(label)
+        if not located and dist_km(CITY_LAT, CITY_LON, lat, lon) > 12:
+            continue
         score = match_score(toks, label)
         if score is None:
             continue
@@ -447,10 +462,26 @@ def _collect(found: dict, features, toks, text, near=None):
                       "dist": dist_km(near[0], near[1], lat, lon) if near else 0.0}
 
 
+def search_places(toks, near=None):
+    """Adminin əlavə etdiyi yerlər (məktəb, mall və s.): bütün sözlər uyğun gələnlər."""
+    out = []
+    for r in fetchall("SELECT * FROM places"):
+        sc = match_score(toks, r["name"])
+        if sc is None or sc < 1:
+            continue
+        out.append({"lat": r["lat"], "lon": r["lon"], "label": r["name"], "score": 1.0, "baku": True,
+                    "order": r["id"], "dist": dist_km(near[0], near[1], r["lat"], r["lon"]) if near else 0.0})
+    out.sort(key=lambda c: (c["dist"], c["order"]))
+    return out
+
+
 async def geocode(text: str, near=None):
     """Ünvanı axtarır (yalnız Bakı radiusu). near=(lat, lon) müştərinin yeridir: eyni dərəcədə uyğun
     nəticələrdən ona yaxın olan öndə göstərilir. Nəticə: [{lat, lon, label, score, baku}], ən çoxu 5."""
     toks = query_tokens(text)
+    own = search_places(toks, near)
+    if own:  # öz siyahımız həmişə birincidir
+        return own[:5]
     primary = correct_query(text)
     found: dict = {}
     numbered = numbered_variants(text, toks)
@@ -493,6 +524,12 @@ def waze(lat, lon) -> str:
     return f"https://waze.com/ul?ll={lat:.6f},{lon:.6f}&navigate=yes"
 
 
+def fmt_kg(w) -> str:
+    """2 -> '2', 2.5 -> '2.5' (vergül yox, nöqtə)."""
+    w = round(float(w), 1)
+    return str(int(w)) if w == int(w) else f"{w:.1f}"
+
+
 def kind_title(kind) -> str:
     return "Kuryer" if kind == "courier" else "Taksi"
 
@@ -509,7 +546,7 @@ def order_text(o, road_km=None) -> str:
     if o["note"]:
         lines.append(f"Qeyd: {esc(o['note'])}")
     if o["weight"]:
-        lines.append(f"Təxmini çəki: {fmt_num(o['weight'])} kq")
+        lines.append(f"Təxmini çəki: {fmt_kg(o['weight'])} kq")
     lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">Gediləcək yer</a>: {esc(o['dest_label'])}")
     lines.append(f"Məsafə: {fmt_num(o['km'])} km")
     return "\n".join(lines)
@@ -543,7 +580,7 @@ ROLES_TEXT = "Salam 👋 Kimsiniz?"
 
 def home_kb():
     """Aşağıda daimi duran düymə."""
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BACK_TEXT)]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BACK_TEXT)]], resize_keyboard=True, is_persistent=True)
 
 
 def customer_phone(uid: int):
@@ -578,7 +615,7 @@ async def next_order_step(m: Message, uid: int, uname: str, p: dict):
     if p.get("kind") == "courier" and "weight" not in p:
         if "note" in p:
             p["await_weight"] = True
-            await m.answer("⚖️ Bağlamanın təxmini çəkisi neçə kq-dır? Rəqəmlə yazın (məs. 2 və ya 3,5).")
+            await m.answer("⚖️ Bağlamanın təxmini çəkisi neçə kq-dır? Rəqəmlə yazın (məs. 2 və ya 2.5).")
         else:
             p["await_note"] = True
             await m.answer("📦 Nə çatdırılacaq? Qısa yazın (məs. sənəd, paket). Keçmək üçün «-» yazın.")
@@ -591,7 +628,7 @@ def start_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)],
                   [KeyboardButton(text=BACK_TEXT)]],
-        resize_keyboard=True,
+        resize_keyboard=True, is_persistent=True,
     )
 
 
@@ -942,11 +979,12 @@ async def on_location(m: Message):
         return
     if "plat" not in p:
         pending[uid] = {"kind": kind, "plat": loc.latitude, "plon": loc.longitude}
-        await m.answer(
-            "Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
-            "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.",
-            reply_markup=home_kb(),
-        )
+        if kind == "courier":
+            ask = "Bağlama hara göndəriləcək? Ünvanı yazın və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
+        else:
+            ask = ("Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
+                   "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.")
+        await m.answer(ask, reply_markup=home_kb())
     else:
         await quote(m, p, loc.latitude, loc.longitude, "Xəritədən seçilmiş nöqtə")
 
@@ -984,7 +1022,7 @@ async def on_text(m: Message):
     if p and p.get("await_weight"):
         w = parse_weight(m.text)
         if w is None:
-            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 3,5 (kq).")
+            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 2.5 (kq).")
             return
         p["weight"] = w
         p.pop("await_weight", None)
@@ -999,7 +1037,7 @@ async def on_text(m: Message):
         return
 
     if "dlat" in p:  # təyinat artıq seçilmişdi, istifadəçi yenisini yazır
-        for k in ("dlat", "dlon", "label", "km", "price", "cands"):
+        for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult"):
             p.pop(k, None)
     cands = await geocode(m.text, near=(p["plat"], p["plon"]))
     if not cands:
@@ -1036,7 +1074,20 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
         await m.answer("Marşrutu hesablaya bilmədim. Bir az sonra yenidən cəhd edin.")
         return
     price, mult = calc_price(km)
-    p.update(dlat=dlat, dlon=dlon, label=label, km=km, price=price)
+    p.update(dlat=dlat, dlon=dlon, label=label, km=km, price=price, mult=mult)
+    if km > FAR_KM and not p.get("far_ok"):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Bəli, davam et", callback_data="q_far")],
+            [InlineKeyboardButton(text="✏️ Başqa ünvan yaz", callback_data="q_edit")],
+        ])
+        await m.answer(f"⚠️ Məsafə {fmt_num(km)} km-dir, bu uzaq məsafədir.\n🏁 Təyinat: {esc(label)}\n"
+                       "Ünvan düzgündür?", reply_markup=kb)
+        return
+    await show_quote(m, p)
+
+
+async def show_quote(m: Message, p: dict):
+    price, mult, label = p["price"], p.get("mult", 1), p["label"]
     note = f" (pik saat ×{fmt_num(PEAK_MULT)})" if mult > 1 else ""
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data="q_ok"),
@@ -1059,13 +1110,25 @@ async def pick_candidate(cb: CallbackQuery):
     await cb.answer()
 
 
+@router.callback_query(F.data == "q_far")
+async def quote_far(cb: CallbackQuery):
+    p = pending.get(cb.from_user.id)
+    if not p or "price" not in p:
+        await cb.answer("Vaxt keçib. /start yazın.", show_alert=True)
+        return
+    p["far_ok"] = True
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await show_quote(cb.message, p)
+    await cb.answer()
+
+
 @router.callback_query(F.data == "q_edit")
 async def quote_edit(cb: CallbackQuery):
     p = pending.get(cb.from_user.id)
     if not p or "plat" not in p:
         await cb.answer("Vaxt keçib. /start yazın.", show_alert=True)
         return
-    for k in ("dlat", "dlon", "label", "km", "price", "cands"):
+    for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult"):
         p.pop(k, None)
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.message.answer("Yeni təyinat ünvanını yazın və ya 📎 → Yer ilə xəritədən nöqtə göndərin.")
@@ -1394,6 +1457,74 @@ async def customer_cancel_do(cb: CallbackQuery):
 
 
 # ---------- Qeydiyyat ----------
+class AddPlace(StatesGroup):
+    pin = State()
+    name = State()
+
+
+def _is_admin(m: Message) -> bool:
+    return m.from_user.id == ADMIN_ID and m.chat.type == ChatType.PRIVATE
+
+
+@router.message(Command("yer_elave"))
+async def cmd_place_add(m: Message, state: FSMContext):
+    if not _is_admin(m):
+        return
+    await state.set_state(AddPlace.pin)
+    await m.answer("📍 Yerin dəqiq nöqtəsini göndərin (📎 → Yer, xəritədə nöqtəni seçin). Ləğv etmək üçün /legv.")
+
+
+@router.message(Command("legv"))
+async def cmd_place_cancel(m: Message, state: FSMContext):
+    if _is_admin(m):
+        await state.clear()
+        await m.answer("Ləğv edildi.")
+
+
+@router.message(AddPlace.pin, F.location)
+async def place_pin(m: Message, state: FSMContext):
+    if not _is_admin(m):
+        return
+    await state.update_data(lat=m.location.latitude, lon=m.location.longitude)
+    await state.set_state(AddPlace.name)
+    await m.answer("Adını yazın. Müştəri bu sözlərlə axtaracaq, məs.: <i>27 nömrəli məktəb (Xətai)</i>")
+
+
+@router.message(AddPlace.name, F.text, ~F.text.startswith("/"))
+async def place_name(m: Message, state: FSMContext):
+    if not _is_admin(m):
+        return
+    data = await state.get_data()
+    name = m.text.strip()[:80]
+    _, pid = execute("INSERT INTO places(name,lat,lon) VALUES(?,?,?)", (name, data["lat"], data["lon"]))
+    await state.clear()
+    await m.answer(f"✅ Əlavə olundu (#{pid}): {esc(name)}\nBaşqa yer üçün /yer_elave, siyahı üçün /yerler.")
+
+
+@router.message(Command("yerler"))
+async def cmd_places(m: Message):
+    if not _is_admin(m):
+        return
+    rows = fetchall("SELECT * FROM places ORDER BY id")
+    if not rows:
+        await m.answer("Siyahı boşdur. Əlavə etmək üçün /yer_elave")
+        return
+    txt = "\n".join(f"#{r['id']} {esc(r['name'])}" for r in rows)
+    await m.answer(f"<b>Yerlər</b>\n{txt[:3500]}\n\nSilmək üçün: /yer_sil nömrə")
+
+
+@router.message(Command("yer_sil"))
+async def cmd_place_del(m: Message):
+    if not _is_admin(m):
+        return
+    arg = (m.text or "").split(maxsplit=1)[1:] or [""]
+    if not arg[0].strip().lstrip("#").isdigit():
+        await m.answer("Nömrə yazın, məs.: /yer_sil 3")
+        return
+    n, _ = execute("DELETE FROM places WHERE id=?", (int(arg[0].strip().lstrip("#")),))
+    await m.answer("Silindi." if n else "Belə nömrə tapılmadı.")
+
+
 class Reg(StatesGroup):
     name = State()
     phone = State()
