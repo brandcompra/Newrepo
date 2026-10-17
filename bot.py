@@ -634,7 +634,17 @@ async def next_order_step(m: Message, uid: int, uname: str, p: dict):
     """Təsdiqdən sonra son tələb: telefon nömrələri. Nömrə(lər) yazılandan sonra sifariş yaradılır."""
     if p.get("kind") == "courier":
         p["await_phones"] = True
-        await m.answer(PHONES_ASK)
+        p["uname"] = uname
+        if WEBAPP_URL:
+            own = customer_phone(uid) or ""
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="📱 Nömrələri yaz",
+                web_app=WebAppInfo(url=f"{WEBAPP_URL}/phones?own={own.replace('+', '%2B')}"))]])
+            await m.answer("📱 Aşağıdakı düyməyə basın, açılan səhifədə iki nömrəni yazıb göndərin.\n\n"
+                           "Səhifə açılmasa, nömrələri bura alt-alta yazın:\n"
+                           "1. Sizin nömrəniz\n2. Bağlamanı qəbul edən şəxsin nömrəsi", reply_markup=kb)
+        else:
+            await m.answer(PHONES_ASK)
         return
     if not customer_phone(uid):
         p["await_phone"] = True
@@ -851,11 +861,101 @@ async def api_track(request):
     }, headers={"Cache-Control": "no-store"})
 
 
+PHONES_PAGE = """<!doctype html>
+<html lang="az"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Telefon nömrələri</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#fff;--fg:#111827;--box:#f3f4f6;--line:#d1d5db;--mut:#6b7280;--btn:#2563eb}
+@media (prefers-color-scheme: dark){:root{--bg:#111827;--fg:#f3f4f6;--box:#1f2937;--line:#374151;--mut:#9ca3af}}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{padding:20px 16px;max-width:480px;margin:0 auto}
+h1{font-size:19px;margin:0 0 16px}
+label{display:block;font-weight:600;margin:14px 0 6px}
+input{width:100%;box-sizing:border-box;padding:13px 12px;font-size:18px;border:1px solid var(--line);border-radius:10px;background:var(--box);color:var(--fg)}
+.hint{color:var(--mut);font-size:13px;margin-top:4px}
+button{width:100%;margin-top:22px;padding:14px;font-size:17px;font-weight:600;border:0;border-radius:10px;background:var(--btn);color:#fff}
+button:disabled{opacity:.6}
+#err{color:#dc2626;margin-top:12px;min-height:20px}
+</style></head><body><main>
+<h1>📱 Telefon nömrələri</h1>
+<label for="own">1. Sizin nömrəniz</label>
+<input id="own" type="tel" inputmode="tel" placeholder="0501234567" autocomplete="tel">
+<label for="recv">2. Bağlamanı qəbul edən şəxsin nömrəsi</label>
+<input id="recv" type="tel" inputmode="tel" placeholder="0557654321">
+<div class="hint">Nömrələr yalnız sifarişi götürən kuryerə göstərilir.</div>
+<div id="err"></div>
+<button id="go">Göndər</button>
+</main>
+<script>
+(function(){
+var tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { try { tg.ready(); tg.expand(); } catch(e){} }
+var q = new URLSearchParams(location.search);
+var own = document.getElementById('own'), recv = document.getElementById('recv');
+own.value = q.get('own') || '';
+var err = document.getElementById('err'), btn = document.getElementById('go');
+function ok(v){ var d = (v||'').replace(/\\D/g,''); return (d.indexOf('994')===0 && d.length===12) || (d[0]==='0' && d.length===10) || d.length===9; }
+btn.onclick = function(){
+  err.textContent = '';
+  if (!ok(own.value)) { err.textContent = '1-ci nömrə düzgün deyil. Məsələn: 0501234567'; own.focus(); return; }
+  if (!ok(recv.value)) { err.textContent = '2-ci nömrə düzgün deyil. Məsələn: 0557654321'; recv.focus(); return; }
+  btn.disabled = true;
+  fetch('/api/phones', {method:'POST', headers:{'Content-Type':'application/json','X-Init-Data': tg ? tg.initData : ''},
+        body: JSON.stringify({own: own.value, recv: recv.value})})
+  .then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+  .then(function(x){
+    if (x.s === 200) { if (tg) tg.close(); else err.textContent = 'Göndərildi ✅'; return; }
+    btn.disabled = false;
+    err.textContent = x.j.error === 'expired' ? 'Sifariş vaxtı keçib. Botda yenidən sifariş verin.' :
+                      x.j.error === 'bad' ? 'Nömrələr düzgün deyil.' : 'Xəta baş verdi. Yenidən cəhd edin.';
+  })
+  .catch(function(){ btn.disabled = false; err.textContent = 'Bağlantı xətası. Yenidən cəhd edin.'; });
+};
+})();
+</script></body></html>"""
+
+BOT_REF = {}
+_tasks: set = set()
+
+
+async def phones_page(request):
+    return web.Response(text=PHONES_PAGE, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def api_phones(request):
+    uid = _auth(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=401)
+    p = pending.get(uid)
+    if not p or not p.get("await_phones"):
+        return web.json_response({"error": "expired"}, status=409)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad"}, status=400)
+    own, recv = parse_phone(str(body.get("own", ""))), parse_phone(str(body.get("recv", "")))
+    if not own or not recv:
+        return web.json_response({"error": "bad"}, status=400)
+    uname = p.get("uname", "")
+    execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone", (uid, uname, own))
+    p["recv_phone"] = recv
+    p.pop("await_phones", None)
+    pending.pop(uid, None)
+    t = asyncio.create_task(dispatch_order(BOT_REF["bot"], uid, uname, p))
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return web.json_response({"ok": True})
+
+
 async def start_web():
     app = web.Application()
     app.add_routes([
         web.get("/", web_health), web.get("/map", web_page),
         web.get("/api/online", api_online), web.get("/api/track", api_track),
+        web.get("/phones", phones_page), web.post("/api/phones", api_phones),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1127,8 +1227,6 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
 async def show_quote(m: Message, p: dict):
     price, mult, label = p["price"], p.get("mult", 1), p["label"]
     note = f" (pik saat ×{fmt_num(PEAK_MULT)})" if mult > 1 else ""
-    if p.get("heavy"):
-        note += f" ({fmt_kg(HEAVY_KG)} kq-dan ağır bağlama ×{fmt_num(HEAVY_MULT)})"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data="q_ok"),
         InlineKeyboardButton(text="❌ Ləğv et", callback_data="q_no"),
@@ -1679,6 +1777,7 @@ async def main():
     init_db()
     runner = await start_web()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
+    BOT_REF["bot"] = bot
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
