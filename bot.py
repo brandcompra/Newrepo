@@ -440,9 +440,9 @@ def accept_kb(oid: int) -> InlineKeyboardMarkup:
 
 def role_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. Sürücüyəm", callback_data="role:driver")],
-        [InlineKeyboardButton(text="2. Kuryerəm", callback_data="role:courier")],
-        [InlineKeyboardButton(text="3. Müştəriyəm", callback_data="role:customer")],
+        [InlineKeyboardButton(text="1. Müştəriyəm", callback_data="role:customer")],
+        [InlineKeyboardButton(text="2. Sürücüyəm", callback_data="role:driver")],
+        [InlineKeyboardButton(text="3. Kuryerəm", callback_data="role:courier")],
     ])
 
 
