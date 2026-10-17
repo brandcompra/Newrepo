@@ -56,6 +56,9 @@ BAKU_LAT, BAKU_LON = 40.46866, 50.01917          # axtarış mərkəzi (Abşeron
 GEO_RADIUS_KM = float(os.environ.get("GEO_RADIUS_KM", "35"))
 SUMGAIT_LAT, SUMGAIT_LON, SUMGAIT_ZONE_KM = 40.589, 49.669, 8.0   # bu dairədəki nəticələr atılır
 CITY_LAT, CITY_LON = 40.4093, 49.8671             # şəhər mərkəzi (yalnız yoxlama üçün)
+HEAVY_KG = float(os.environ.get("HEAVY_KG", "6"))        # bundan ağır bağlamada əmsal
+HEAVY_MULT = float(os.environ.get("HEAVY_MULT", "1.3"))
+MAX_KG = float(os.environ.get("MAX_KG", "12"))            # bundan ağır bağlama qəbul olunmur
 FAR_KM = float(os.environ.get("FAR_KM", "15"))    # bundan uzaq təyinatda müştəridən təsdiq istənilir
 
 # ---------- Tarif ----------
@@ -152,7 +155,7 @@ def init_db():
         ("drivers", "online", "INTEGER DEFAULT 0"), ("drivers", "kind", "TEXT DEFAULT 'taxi'"),
         ("orders", "kind", "TEXT DEFAULT 'taxi'"), ("orders", "note", "TEXT"),
         ("orders", "cust_msg_id", "INTEGER"), ("orders", "drv_msg_id", "INTEGER"),
-        ("orders", "weight", "REAL"),
+        ("orders", "weight", "REAL"), ("orders", "recv_phone", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -606,19 +609,36 @@ def parse_phone(text: str):
     return "+" + d
 
 
+PHONES_ASK = ("📱 Telefon nömrələrini alt-alta yazın:\n"
+              "1. Sizin nömrəniz\n"
+              "2. Bağlamanı qəbul edən şəxsin nömrəsi\n\n"
+              "Nümunə:\n0501234567\n0557654321")
+WEIGHT_ASK = "📦 Bağlamanın təxmini çəkisi neçə kq-dır? Rəqəmlə yazın."
+
+
+def parse_two_phones(text: str):
+    """Alt-alta (və ya vergüllə) yazılmış iki nömrə: (öz nömrəsi, qəbul edənin nömrəsi) və ya None."""
+    parts = [x for x in re.split(r"[\n,;]+", text or "") if x.strip()]
+    if len(parts) < 2:
+        return None
+    nums = []
+    for x in parts[:2]:
+        ph = parse_phone(re.sub(r"^\s*[12][.)]\s*", "", x))
+        if not ph:
+            return None
+        nums.append(ph)
+    return nums[0], nums[1]
+
+
 async def next_order_step(m: Message, uid: int, uname: str, p: dict):
-    """Təsdiqdən sonra: nömrə -> (kuryer üçün qeyd, çəki) -> sifarişin göndərilməsi."""
+    """Təsdiqdən sonra son tələb: telefon nömrələri. Nömrə(lər) yazılandan sonra sifariş yaradılır."""
+    if p.get("kind") == "courier":
+        p["await_phones"] = True
+        await m.answer(PHONES_ASK)
+        return
     if not customer_phone(uid):
         p["await_phone"] = True
         await m.answer(PHONE_ASK)
-        return
-    if p.get("kind") == "courier" and "weight" not in p:
-        if "note" in p:
-            p["await_weight"] = True
-            await m.answer("⚖️ Bağlamanın təxmini çəkisi neçə kq-dır? Rəqəmlə yazın (məs. 2 və ya 2.5).")
-        else:
-            p["await_note"] = True
-            await m.answer("📦 Nə çatdırılacaq? Qısa yazın (məs. sənəd, paket). Keçmək üçün «-» yazın.")
         return
     pending.pop(uid, None)
     await dispatch_order(m.bot, uid, uname, p)
@@ -1008,25 +1028,36 @@ async def on_text(m: Message):
                 "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone",
                 (uid, m.from_user.full_name, phone))
         p.pop("await_phone", None)
-        await next_order_step(m, uid, m.from_user.full_name, p)
+        pending.pop(uid, None)
+        await dispatch_order(m.bot, uid, m.from_user.full_name, p)
         return
 
-    # Kuryer: "nə çatdırılacaq" qeydi
-    if p and p.get("await_note"):
-        t = m.text.strip()
-        p["note"] = "" if t in ("-", "—") else t[:200]
-        p.pop("await_note", None)
-        await next_order_step(m, uid, m.from_user.full_name, p)
+    if p and p.get("await_phones"):
+        two = parse_two_phones(m.text)
+        if not two:
+            await m.answer("Hər iki nömrəni alt-alta yazın, məsələn:\n0501234567\n0557654321")
+            return
+        own, recv = two
+        execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone",
+                (uid, m.from_user.full_name, own))
+        p["recv_phone"] = recv
+        p.pop("await_phones", None)
+        pending.pop(uid, None)
+        await dispatch_order(m.bot, uid, m.from_user.full_name, p)
         return
 
     if p and p.get("await_weight"):
         w = parse_weight(m.text)
         if w is None:
-            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 2.5 (kq).")
+            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 2.5")
+            return
+        if w > MAX_KG:
+            await m.answer(f"Bağlamanın çəkisi {fmt_kg(MAX_KG)} kq-dan çox ola bilməz. Daha yüngül çəki yazın.")
             return
         p["weight"] = w
         p.pop("await_weight", None)
-        await next_order_step(m, uid, m.from_user.full_name, p)
+        await quote(m, p, p["dlat"], p["dlon"], p["label"])
         return
 
     if not p or "plat" not in p:
@@ -1037,7 +1068,7 @@ async def on_text(m: Message):
         return
 
     if "dlat" in p:  # təyinat artıq seçilmişdi, istifadəçi yenisini yazır
-        for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult"):
+        for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult", "heavy"):
             p.pop(k, None)
     cands = await geocode(m.text, near=(p["plat"], p["plon"]))
     if not cands:
@@ -1069,12 +1100,19 @@ def parse_weight(text: str):
 
 
 async def quote(m: Message, p: dict, dlat, dlon, label):
+    if p.get("kind") == "courier" and "weight" not in p:   # kuryerdə qiymətdən əvvəl çəki soruşulur
+        p.update(dlat=dlat, dlon=dlon, label=label, await_weight=True)
+        await m.answer(WEIGHT_ASK)
+        return
     km = await route_km(p["plat"], p["plon"], dlat, dlon)
     if km is None:
         await m.answer("Marşrutu hesablaya bilmədim. Bir az sonra yenidən cəhd edin.")
         return
     price, mult = calc_price(km)
-    p.update(dlat=dlat, dlon=dlon, label=label, km=km, price=price, mult=mult)
+    heavy = p.get("weight", 0) > HEAVY_KG
+    if heavy:
+        price = round(price * HEAVY_MULT, 1)
+    p.update(dlat=dlat, dlon=dlon, label=label, km=km, price=price, mult=mult, heavy=heavy)
     if km > FAR_KM and not p.get("far_ok"):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Bəli, davam et", callback_data="q_far")],
@@ -1089,6 +1127,8 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
 async def show_quote(m: Message, p: dict):
     price, mult, label = p["price"], p.get("mult", 1), p["label"]
     note = f" (pik saat ×{fmt_num(PEAK_MULT)})" if mult > 1 else ""
+    if p.get("heavy"):
+        note += f" ({fmt_kg(HEAVY_KG)} kq-dan ağır bağlama ×{fmt_num(HEAVY_MULT)})"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data="q_ok"),
         InlineKeyboardButton(text="❌ Ləğv et", callback_data="q_no"),
@@ -1128,7 +1168,7 @@ async def quote_edit(cb: CallbackQuery):
     if not p or "plat" not in p:
         await cb.answer("Vaxt keçib. /start yazın.", show_alert=True)
         return
-    for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult"):
+    for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult", "heavy"):
         p.pop(k, None)
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.message.answer("Yeni təyinat ünvanını yazın və ya 📎 → Yer ilə xəritədən nöqtə göndərin.")
@@ -1189,21 +1229,22 @@ def cancel_kb(oid: int) -> InlineKeyboardMarkup:
 
 async def dispatch_order(bot, uid: int, uname: str, p: dict):
     _, oid = execute(
-        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,created) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,recv_phone,created) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (uid, uname, p.get("kind", "taxi"), p["plat"], p["plon"], p["dlat"], p["dlon"], p["label"],
-         p["km"], p["price"], p.get("note", ""), p.get("weight"), datetime.now(TZ).isoformat()),
+         p["km"], p["price"], p.get("note", ""), p.get("weight"), p.get("recv_phone"), datetime.now(TZ).isoformat()),
     )
     sent, group_ok = await offer_order(bot, oid)
     if sent == 0 and not group_ok:
         execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
-        await bot.send_message(uid, "😕 Sifarişi sürücülərə çatdıra bilmədim. Bir az sonra yenidən cəhd edin: /start")
+        await bot.send_message(uid, "😕 Sifarişi çatdıra bilmədim. Bir az sonra yenidən cəhd edin: /start")
         return
+    cour = p.get("kind") == "courier"
     parts = []
     if sent:
-        parts.append(f"{sent} yaxın sürücüyə")
+        parts.append(f"{sent} yaxın {'kuryerə' if cour else 'sürücüyə'}")
     if group_ok:
-        parts.append("sürücülər qrupuna")
+        parts.append("kuryerlər qrupuna" if cour else "sürücülər qrupuna")
     await bot.send_message(
         uid, f"✅ Sifariş #{oid} {' və '.join(parts)} göndərildi. Qəbul edən kimi məlumat gələcək.",
         reply_markup=cancel_kb(oid),
@@ -1281,7 +1322,8 @@ async def accept(cb: CallbackQuery):
             d["user_id"],
             "✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
             + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
-            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else ""),
+            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else "")
+            + (f"\nQəbul edən şəxsin telefonu: {esc(o['recv_phone'])}" if o["recv_phone"] else ""),
             reply_markup=order_driver_kb(oid),
         )
         execute("UPDATE orders SET drv_msg_id=? WHERE id=?", (dmsg.message_id, oid))
