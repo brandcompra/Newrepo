@@ -129,6 +129,9 @@ def init_db():
             kind TEXT DEFAULT 'taxi', note TEXT,
             cust_msg_id INTEGER, drv_msg_id INTEGER
         );
+        CREATE TABLE IF NOT EXISTS customers(
+            user_id INTEGER PRIMARY KEY, name TEXT, phone TEXT
+        );
         CREATE TABLE IF NOT EXISTS notifs(
             order_id INTEGER, chat_id INTEGER, msg_id INTEGER, driver_id INTEGER
         );
@@ -143,6 +146,7 @@ def init_db():
         ("drivers", "online", "INTEGER DEFAULT 0"), ("drivers", "kind", "TEXT DEFAULT 'taxi'"),
         ("orders", "kind", "TEXT DEFAULT 'taxi'"), ("orders", "note", "TEXT"),
         ("orders", "cust_msg_id", "INTEGER"), ("orders", "drv_msg_id", "INTEGER"),
+        ("orders", "weight", "REAL"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -331,6 +335,46 @@ def query_tokens(text: str):
     return [t for t in re.split(r"\W+", norm(text)) if (len(t) >= 2 or t.isdigit()) and t not in _SKIP]
 
 
+# Say ilə işlənən obyektlər: "27 məktəb" -> "27 nömrəli məktəb" və s.
+_TYPE_WORDS = {
+    "school": ["mekteb", "mektebi", "lisey", "liseyi", "gimnaziya", "gimnaziyasi", "school"],
+    "clinic": ["poliklinika", "poliklinikasi", "xestexana", "xestexanasi", "hospital", "clinic"],
+    "kindergarten": ["bagca", "bagcasi", "kindergarten"],
+}
+_SYNONYMS = {
+    "mekteb": ["school", "mekteb", "lisey", "gimnaziya"],
+    "lisey": ["licey", "lyceum", "lisey", "mekteb"],
+    "gimnaziya": ["gymnasium", "gimnaziya", "mekteb"],
+    "xestexana": ["hospital", "xestexana"],
+    "poliklinika": ["clinic", "poliklinika"],
+    "bagca": ["kindergarten", "bagca"],
+}
+
+
+def numbered_variants(text: str, toks):
+    """Yalnız rəqəm (27, 55) və ya rəqəm + məktəb/poliklinika/bağça yazılıbsa, Azərbaycanda
+    qəbul olunmuş adlarla bir neçə axtarış variantı yaradır."""
+    nums = [t for t in toks if t.isdigit()]
+    alpha = [t for t in toks if not t.isdigit()]
+    if len(nums) != 1:
+        return []
+    n = nums[0]
+    kind = None
+    for k, words in _TYPE_WORDS.items():
+        if any(a in words for a in alpha):
+            kind = k
+            break
+    if alpha and not kind:
+        return []
+    if kind in (None, "school"):
+        return [f"{n} nömrəli məktəb", f"{n} nömrəli tam orta məktəb", f"{n} saylı məktəb",
+                f"Məktəb {n}", f"{n} nömrəli lisey", f"{n} nömrəli gimnaziya", f"School {n}"]
+    if kind == "clinic":
+        return [f"{n} nömrəli poliklinika", f"{n} saylı poliklinika", f"{n} nömrəli xəstəxana",
+                f"Poliklinika {n}"]
+    return [f"{n} nömrəli uşaq bağçası", f"{n} saylı uşaq bağçası", f"Uşaq bağçası {n}"]
+
+
 def match_score(tokens, label: str):
     """Sorğudakı sözlərin neçə faizi adda var (1.0 = hamısı).
     Rəqəmlər tam uyğun olmalıdır (27 sorğusu 272-ni tapmır); uyğun deyilsə None qaytarır."""
@@ -343,18 +387,32 @@ def match_score(tokens, label: str):
         return None
     alpha = [t for t in tokens if not t.isdigit()]
 
-    def hit(t):  # "bazarı" sorğusu "bazar" adını da tapsın
-        return t in nl or (len(t) >= 5 and (t[:-1] in nl or t[:-2] in nl))
+    def hit(t):  # "bazarı" sorğusu "bazar" adını da tapsın; məktəb ~ school
+        if t in nl or (len(t) >= 5 and (t[:-1] in nl or t[:-2] in nl)):
+            return True
+        return any(w in nl for w in _SYNONYMS.get(t, ()))
 
     return (len(nums) + sum(1 for t in alpha if hit(t))) / len(tokens)
 
 
-async def _pelias(q: str):
+_NOT_BAKU = ("sumqayit", "sumgait", "sumqayıt")
+
+
+def in_baku(props: dict, label: str) -> bool:
+    """Sumqayıt və s. şəhərlərin nəticələrini atır (25 km radiusa sərhəd hissələri düşə bilir)."""
+    blob = norm(" ".join(str(props.get(k, "")) for k in ("locality", "localadmin", "county", "macrocounty")) + " " + label)
+    return not any(norm(w) in blob for w in _NOT_BAKU)
+
+
+async def _pelias(q: str, near=None):
     params = {
         "api_key": ORS_KEY, "text": q, "boundary.country": "AZ",
         "boundary.circle.lat": str(BAKU_LAT), "boundary.circle.lon": str(BAKU_LON),
         "boundary.circle.radius": str(GEO_RADIUS_KM), "size": "10",
     }
+    if near:
+        params["focus.point.lat"] = str(near[0])
+        params["focus.point.lon"] = str(near[1])
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(GEOCODE_URL, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -365,7 +423,7 @@ async def _pelias(q: str):
         return []
 
 
-def _collect(found: dict, features, toks, text):
+def _collect(found: dict, features, toks, text, near=None):
     for f in features:
         try:
             lon, lat = f["geometry"]["coordinates"]
@@ -373,7 +431,10 @@ def _collect(found: dict, features, toks, text):
             continue
         if dist_km(BAKU_LAT, BAKU_LON, lat, lon) > GEO_RADIUS_KM:
             continue
-        label = f.get("properties", {}).get("label") or text
+        props = f.get("properties", {}) or {}
+        label = props.get("label") or text
+        if not in_baku(props, label):
+            continue
         score = match_score(toks, label)
         if score is None:
             continue
@@ -382,23 +443,44 @@ def _collect(found: dict, features, toks, text):
             continue
         nl = norm(label)
         found[key] = {"lat": lat, "lon": lon, "label": label, "score": score,
-                      "baku": ("baku" in nl or "baki" in nl), "order": len(found)}
+                      "baku": ("baku" in nl or "baki" in nl), "order": len(found),
+                      "dist": dist_km(near[0], near[1], lat, lon) if near else 0.0}
 
 
-async def geocode(text: str):
-    """Ünvanı axtarır (yalnız Bakı radiusu). Nəticə: [{lat, lon, label, score, baku}], ən çoxu 5."""
+async def geocode(text: str, near=None):
+    """Ünvanı axtarır (yalnız Bakı radiusu). near=(lat, lon) müştərinin yeridir: eyni dərəcədə uyğun
+    nəticələrdən ona yaxın olan öndə göstərilir. Nəticə: [{lat, lon, label, score, baku}], ən çoxu 5."""
     toks = query_tokens(text)
     primary = correct_query(text)
     found: dict = {}
-    stage1 = [f"{primary}, Baku, Azerbaijan"] + ([primary] if primary else [])
-    for feats in await asyncio.gather(*[_pelias(q) for q in stage1]):
-        _collect(found, feats, toks, text)
+    numbered = numbered_variants(text, toks)
+    pure_number = bool(toks) and all(t.isdigit() for t in toks)
+    if numbered:
+        # "27", "27 məktəb", "55" -> nömrəli obyekt adları ilə axtar
+        queries = [f"{v}, Baku" for v in numbered[:5]] + numbered[5:7]
+        for feats in await asyncio.gather(*[_pelias(q, near) for q in queries]):
+            _collect(found, feats, toks, text, near)
+    if not (pure_number and found):
+        stage1 = [f"{primary}, Baku, Azerbaijan"] + ([primary] if primary else [])
+        for feats in await asyncio.gather(*[_pelias(q, near) for q in stage1]):
+            _collect(found, feats, toks, text, near)
     if not any(c["score"] >= 1 for c in found.values()):
         variants = schwa_variants(primary)[:2]
         if variants:
-            for feats in await asyncio.gather(*[_pelias(v) for v in variants]):
-                _collect(found, feats, toks, text)
-    cands = sorted(found.values(), key=lambda c: (-c["score"], not c["baku"], c["order"]))
+            for feats in await asyncio.gather(*[_pelias(v, near) for v in variants]):
+                _collect(found, feats, toks, text, near)
+    if pure_number:
+        # yalnız rəqəm yazılıbsa: məktəb/lisey/gimnaziya kimi nömrəli obyektləri üstün tut
+        def is_inst(c):
+            nl = norm(c["label"])
+            return any(w in nl for ws in _TYPE_WORDS.values() for w in ws)
+        inst = [c for c in found.values() if is_inst(c)]
+        pool = inst or list(found.values())
+        cands = sorted(pool, key=lambda c: (not c["baku"], c["dist"], c["order"]))
+        for c in cands:
+            c["score"] = max(c["score"], 1.0)
+    else:
+        cands = sorted(found.values(), key=lambda c: (-c["score"], not c["baku"], c["order"]))
     return cands[:5]
 
 
@@ -426,6 +508,8 @@ def order_text(o, road_km=None) -> str:
     ]
     if o["note"]:
         lines.append(f"Qeyd: {esc(o['note'])}")
+    if o["weight"]:
+        lines.append(f"Təxmini çəki: {fmt_num(o['weight'])} kq")
     lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">Gediləcək yer</a>: {esc(o['dest_label'])}")
     lines.append(f"Məsafə: {fmt_num(o['km'])} km")
     return "\n".join(lines)
@@ -453,9 +537,60 @@ def customer_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
+BACK_TEXT = "🏠 Əvvələ qayıt"
+ROLES_TEXT = "Salam 👋 Kimsiniz?"
+
+
+def home_kb():
+    """Aşağıda daimi duran düymə."""
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BACK_TEXT)]], resize_keyboard=True)
+
+
+def customer_phone(uid: int):
+    r = fetch("SELECT phone FROM customers WHERE user_id=?", (uid,))
+    return r["phone"] if r and r["phone"] else None
+
+
+PHONE_ASK = ("📱 Sifarişi göndərmək üçün telefon nömrənizi yazın (məs. 0501234567). "
+             "Nömrə yalnız sifarişi qəbul edən sürücü və ya kuryerə göstərilir. Bir dəfə yazmaq kifayətdir.")
+
+
+def parse_phone(text: str):
+    """Azərbaycan nömrəsini +994XXXXXXXXX formasına salır; düz deyilsə None."""
+    d = re.sub(r"\D", "", text or "")
+    if d.startswith("994") and len(d) == 12:
+        pass
+    elif d.startswith("0") and len(d) == 10:
+        d = "994" + d[1:]
+    elif len(d) == 9:
+        d = "994" + d
+    else:
+        return None
+    return "+" + d
+
+
+async def next_order_step(m: Message, uid: int, uname: str, p: dict):
+    """Təsdiqdən sonra: nömrə -> (kuryer üçün qeyd, çəki) -> sifarişin göndərilməsi."""
+    if not customer_phone(uid):
+        p["await_phone"] = True
+        await m.answer(PHONE_ASK)
+        return
+    if p.get("kind") == "courier" and "weight" not in p:
+        if "note" in p:
+            p["await_weight"] = True
+            await m.answer("⚖️ Bağlamanın təxmini çəkisi neçə kq-dır? Rəqəmlə yazın (məs. 2 və ya 3,5).")
+        else:
+            p["await_note"] = True
+            await m.answer("📦 Nə çatdırılacaq? Qısa yazın (məs. sənəd, paket). Keçmək üçün «-» yazın.")
+        return
+    pending.pop(uid, None)
+    await dispatch_order(m.bot, uid, uname, p)
+
+
 def start_kb():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)]],
+        keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)],
+                  [KeyboardButton(text=BACK_TEXT)]],
         resize_keyboard=True,
     )
 
@@ -683,7 +818,15 @@ LIVE_HELP = (
 async def start(m: Message, state: FSMContext):
     await state.clear()
     pending.pop(m.from_user.id, None)
-    await m.answer("Salam! 👋 Kimsiniz?\n\n1. Sürücüyəm\n2. Kuryerəm\n3. Müştəriyəm", reply_markup=role_kb())
+    await m.answer("Aşağıdakı «Əvvələ qayıt» düyməsi istənilən vaxt əsas menyuya qaytarır.", reply_markup=home_kb())
+    await m.answer(ROLES_TEXT, reply_markup=role_kb())
+
+
+@router.message(F.text == BACK_TEXT, F.chat.type == ChatType.PRIVATE)
+async def go_home(m: Message, state: FSMContext):
+    await state.clear()
+    pending.pop(m.from_user.id, None)
+    await m.answer(ROLES_TEXT, reply_markup=role_kb())
 
 
 @router.message(Command("id"))
@@ -797,12 +940,12 @@ async def on_location(m: Message):
     if not kind:
         await m.answer("Nə lazımdır?", reply_markup=customer_menu_kb())
         return
-    if "dlat" in p or "plat" not in p:
+    if "plat" not in p:
         pending[uid] = {"kind": kind, "plat": loc.latitude, "plon": loc.longitude}
         await m.answer(
             "Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
             "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=home_kb(),
         )
     else:
         await quote(m, p, loc.latitude, loc.longitude, "Xəritədən seçilmiş nöqtə")
@@ -818,23 +961,47 @@ async def on_text(m: Message):
     uid = m.from_user.id
     p = pending.get(uid)
 
+    if p and p.get("await_phone"):
+        phone = parse_phone(m.text)
+        if not phone:
+            await m.answer("Nömrə düzgün deyil. Məsələn: 0501234567")
+            return
+        execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone",
+                (uid, m.from_user.full_name, phone))
+        p.pop("await_phone", None)
+        await next_order_step(m, uid, m.from_user.full_name, p)
+        return
+
     # Kuryer: "nə çatdırılacaq" qeydi
     if p and p.get("await_note"):
         t = m.text.strip()
         p["note"] = "" if t in ("-", "—") else t[:200]
         p.pop("await_note", None)
-        pending.pop(uid, None)
-        await dispatch_order(m.bot, uid, m.from_user.full_name, p)
+        await next_order_step(m, uid, m.from_user.full_name, p)
         return
 
-    if not p or "plat" not in p or "dlat" in p:
+    if p and p.get("await_weight"):
+        w = parse_weight(m.text)
+        if w is None:
+            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 3,5 (kq).")
+            return
+        p["weight"] = w
+        p.pop("await_weight", None)
+        await next_order_step(m, uid, m.from_user.full_name, p)
+        return
+
+    if not p or "plat" not in p:
         if p and p.get("kind") and "plat" not in p:
             await m.answer("Əvvəlcə yerinizi göndərin 👇", reply_markup=start_kb())
         else:
-            await m.answer("Menyudan seçin:", reply_markup=role_kb())
+            await m.answer(ROLES_TEXT, reply_markup=role_kb())
         return
 
-    cands = await geocode(m.text)
+    if "dlat" in p:  # təyinat artıq seçilmişdi, istifadəçi yenisini yazır
+        for k in ("dlat", "dlon", "label", "km", "price", "cands"):
+            p.pop(k, None)
+    cands = await geocode(m.text, near=(p["plat"], p["plon"]))
     if not cands:
         await m.answer(
             "Bakı daxilində bu ünvanı tapa bilmədim. Daha dəqiq yazın "
@@ -855,6 +1022,14 @@ async def on_text(m: Message):
     await m.answer(f"{note}\nSeçin və ya 📎 → Yer ilə xəritədən nöqtə göndərin:", reply_markup=kb)
 
 
+def parse_weight(text: str):
+    m = re.search(r"\d+(?:[.,]\d+)?", text or "")
+    if not m:
+        return None
+    w = float(m.group().replace(",", "."))
+    return round(w, 1) if 0 < w <= 200 else None
+
+
 async def quote(m: Message, p: dict, dlat, dlon, label):
     km = await route_km(p["plat"], p["plon"], dlat, dlon)
     if km is None:
@@ -866,7 +1041,7 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data="q_ok"),
         InlineKeyboardButton(text="❌ Ləğv et", callback_data="q_no"),
-    ]])
+    ], [InlineKeyboardButton(text="✏️ Ünvanı dəyiş", callback_data="q_edit")]])
     await m.answer(f"🏁 Təyinat: {esc(label)}\n💰 Qiymət: <b>{fmt_num(price)} ₼</b>{note}", reply_markup=kb)
 
 
@@ -881,6 +1056,19 @@ async def pick_candidate(cb: CallbackQuery):
     p.pop("cands", None)
     await cb.message.edit_reply_markup(reply_markup=None)
     await quote(cb.message, p, c["lat"], c["lon"], c["label"])
+    await cb.answer()
+
+
+@router.callback_query(F.data == "q_edit")
+async def quote_edit(cb: CallbackQuery):
+    p = pending.get(cb.from_user.id)
+    if not p or "plat" not in p:
+        await cb.answer("Vaxt keçib. /start yazın.", show_alert=True)
+        return
+    for k in ("dlat", "dlon", "label", "km", "price", "cands"):
+        p.pop(k, None)
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer("Yeni təyinat ünvanını yazın və ya 📎 → Yer ilə xəritədən nöqtə göndərin.")
     await cb.answer()
 
 
@@ -902,13 +1090,7 @@ async def quote_ok(cb: CallbackQuery):
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    if p.get("kind") == "courier" and "note" not in p:
-        p["await_note"] = True
-        await cb.message.answer("📦 Nə çatdırılacaq? Qısa yazın (məs. sənəd, paket). Keçmək üçün «-» yazın.")
-        await cb.answer()
-        return
-    pending.pop(uid, None)
-    await dispatch_order(cb.bot, uid, cb.from_user.full_name, p)
+    await next_order_step(cb.message, uid, cb.from_user.full_name, p)
     await cb.answer()
 
 
@@ -944,10 +1126,10 @@ def cancel_kb(oid: int) -> InlineKeyboardMarkup:
 
 async def dispatch_order(bot, uid: int, uname: str, p: dict):
     _, oid = execute(
-        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,created) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,created) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (uid, uname, p.get("kind", "taxi"), p["plat"], p["plon"], p["dlat"], p["dlon"], p["label"],
-         p["km"], p["price"], p.get("note", ""), datetime.now(TZ).isoformat()),
+         p["km"], p["price"], p.get("note", ""), p.get("weight"), datetime.now(TZ).isoformat()),
     )
     sent, group_ok = await offer_order(bot, oid)
     if sent == 0 and not group_ok:
@@ -1035,7 +1217,8 @@ async def accept(cb: CallbackQuery):
         dmsg = await cb.bot.send_message(
             d["user_id"],
             "✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
-            + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>",
+            + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
+            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else ""),
             reply_markup=order_driver_kb(oid),
         )
         execute("UPDATE orders SET drv_msg_id=? WHERE id=?", (dmsg.message_id, oid))
@@ -1222,7 +1405,7 @@ async def _reg_start(target: Message, state: FSMContext, kind: str):
     await state.set_state(Reg.name)
     await state.update_data(kind=kind)
     await target.answer(f"{'Kuryer' if kind == 'courier' else 'Sürücü'} qeydiyyatı. Ad və soyadınızı yazın:",
-                        reply_markup=ReplyKeyboardRemove())
+                        reply_markup=home_kb())
 
 
 @router.message(Command("driver"), F.chat.type == ChatType.PRIVATE)
