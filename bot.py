@@ -448,8 +448,8 @@ def role_kb() -> InlineKeyboardMarkup:
 
 def customer_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. Taksi çağır", callback_data="order:taxi")],
-        [InlineKeyboardButton(text="2. Kuryer çağır", callback_data="order:courier")],
+        [InlineKeyboardButton(text="🚕 Taksi çağır", callback_data="order:taxi")],
+        [InlineKeyboardButton(text="🛵 Kuryer çağır", callback_data="order:courier")],
     ])
 
 
