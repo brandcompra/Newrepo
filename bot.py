@@ -118,12 +118,16 @@ def init_db():
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS drivers(
-            user_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
             name TEXT, phone TEXT, car TEXT, plate TEXT,
             approved INTEGER DEFAULT 0,
             lat REAL, lon REAL, loc_time REAL,
             online INTEGER DEFAULT 0,
-            kind TEXT DEFAULT 'taxi'
+            kind TEXT DEFAULT 'taxi',
+            PRIMARY KEY (user_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS active_role(
+            user_id INTEGER PRIMARY KEY, kind TEXT
         );
         CREATE TABLE IF NOT EXISTS orders(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,6 +166,25 @@ def init_db():
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    conn.commit()
+    # köhnə baza: hər istifadəçiyə bir qeyd idi -> indi (istifadəçi, rol) üzrə ayrı qeyd
+    pk = [c[1] for c in conn.execute("PRAGMA table_info(drivers)").fetchall() if c[5]]
+    if pk == ["user_id"]:
+        conn.executescript(
+            """
+            ALTER TABLE drivers RENAME TO drivers_old;
+            CREATE TABLE drivers(
+                user_id INTEGER, name TEXT, phone TEXT, car TEXT, plate TEXT,
+                approved INTEGER DEFAULT 0, lat REAL, lon REAL, loc_time REAL,
+                online INTEGER DEFAULT 0, kind TEXT DEFAULT 'taxi',
+                PRIMARY KEY (user_id, kind)
+            );
+            INSERT INTO drivers(user_id,name,phone,car,plate,approved,lat,lon,loc_time,online,kind)
+              SELECT user_id,name,phone,car,plate,approved,lat,lon,loc_time,online,COALESCE(kind,'taxi')
+              FROM drivers_old;
+            DROP TABLE drivers_old;
+            """
+        )
     conn.commit()
     conn.close()
 
@@ -684,10 +707,35 @@ def order_driver_kb(oid: int) -> InlineKeyboardMarkup:
     ])
 
 
+def set_active_role(uid: int, kind: str):
+    execute("INSERT INTO active_role(user_id,kind) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind", (uid, kind))
+
+
+def approved_kinds(uid: int) -> set:
+    return {r["kind"] for r in fetchall("SELECT kind FROM drivers WHERE user_id=? AND approved=1", (uid,))}
+
+
+def pick_kind(uid: int):
+    """İşləyəcəyi rol: yalnız biri təsdiqlənibsə o, ikisi də təsdiqlənibsə axırıncı seçilən; yoxdursa None."""
+    kinds = approved_kinds(uid)
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    if len(kinds) > 1:
+        a = fetch("SELECT kind FROM active_role WHERE user_id=?", (uid,))
+        if a and a["kind"] in kinds:
+            return a["kind"]
+    return None
+
+
 def set_driver_live(uid: int, loc) -> int:
+    kind = pick_kind(uid)
+    if not kind:
+        return 0
+    execute("UPDATE drivers SET online=0 WHERE user_id=? AND kind!=?", (uid, kind))   # eyni anda yalnız bir rolda onlayn
     n, _ = execute(
-        "UPDATE drivers SET online=1, lat=?, lon=?, loc_time=? WHERE user_id=? AND approved=1",
-        (loc.latitude, loc.longitude, time.time(), uid),
+        "UPDATE drivers SET online=1, lat=?, lon=?, loc_time=? WHERE user_id=? AND kind=? AND approved=1",
+        (loc.latitude, loc.longitude, time.time(), uid, kind),
     )
     return n
 
@@ -857,7 +905,7 @@ async def api_track(request):
         return web.json_response({"error": "forbidden"}, status=403)
     if o["status"] != "accepted":
         return web.json_response({"status": o["status"]}, headers={"Cache-Control": "no-store"})
-    d = fetch("SELECT lat, lon, loc_time FROM drivers WHERE user_id=?", (o["driver_id"],))
+    d = fetch("SELECT lat, lon, loc_time FROM drivers WHERE user_id=? AND kind=?", (o["driver_id"], o["kind"]))
     drv = None
     if d and d["lat"] is not None:
         drv = {"lat": d["lat"], "lon": d["lon"], "age": int(time.time() - (d["loc_time"] or 0))}
@@ -1015,8 +1063,10 @@ async def get_id(m: Message):
 @router.callback_query(F.data.in_({"role:driver", "role:courier"}))
 async def role_worker(cb: CallbackQuery):
     kind = "courier" if cb.data == "role:courier" else "taxi"
-    d = fetch("SELECT * FROM drivers WHERE user_id=?", (cb.from_user.id,))
-    registered = d is not None and d["kind"] == kind
+    d = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=?", (cb.from_user.id, kind))
+    registered = d is not None
+    if registered and d["approved"]:
+        set_active_role(cb.from_user.id, kind)
     lines = [f"<b>{'🛵 Kuryer' if kind == 'courier' else '🚕 Sürücü'} bölməsi</b>", ""]
     if not registered:
         lines.append("Əvvəlcə qeydiyyatdan keçin. Admin təsdiqləyəndən sonra işə başlaya bilərsiniz.")
@@ -1024,6 +1074,8 @@ async def role_worker(cb: CallbackQuery):
         lines.append("Qeydiyyatınız admin təsdiqini gözləyir.")
     else:
         lines.append("Siz təsdiqlənmisiniz.")
+        if len(approved_kinds(cb.from_user.id)) > 1:
+            lines.append("Hər iki rolunuz var. İşə başlayanda bu rolda onlayn olacaqsınız. Digər rola keçmək üçün /start yazıb onu seçin.")
     lines += ["", "İşə başlamaq: 🟢 Onlayn düyməsi və ya /onlayn", "Dayandırmaq: 🔴 Oflayn düyməsi və ya /oflayn"]
     rows = [[InlineKeyboardButton(text="🟢 Onlayn", callback_data="on"),
              InlineKeyboardButton(text="🔴 Oflayn", callback_data="off")]]
@@ -1034,11 +1086,15 @@ async def role_worker(cb: CallbackQuery):
 
 
 async def _go_online(target: Message, uid: int):
-    d = fetch("SELECT * FROM drivers WHERE user_id=? AND approved=1", (uid,))
-    if not d:
+    if not approved_kinds(uid):
         await target.answer("Əvvəlcə qeydiyyatdan keçin (/driver sürücü, /kuryer kuryer) və admin təsdiqini gözləyin.")
         return
-    await target.answer("🟢 İşə başlamaq üçün canlı yerinizi göndərin:\n\n" + LIVE_HELP)
+    kind = pick_kind(uid)
+    if not kind:
+        await target.answer("Hər iki rolunuz var. Əvvəlcə /start yazıb «Sürücüyəm» və ya «Kuryerəm» bölməsini açın, sonra işə başlayın.")
+        return
+    role = "kuryer" if kind == "courier" else "sürücü"
+    await target.answer(f"🟢 {role.capitalize()} kimi işə başlamaq üçün canlı yerinizi göndərin:\n\n" + LIVE_HELP)
 
 
 async def _go_offline(target: Message, uid: int):
@@ -1107,6 +1163,8 @@ async def on_location(m: Message):
                 f"🟢 Onlayn oldunuz. {fmt_num(RADIUS_KM)} km radiusdakı sifarişlər sizə gələcək.\n"
                 "Dayandırmaq üçün /oflayn yazın və canlı yer paylaşımını söndürün."
             )
+        elif len(approved_kinds(uid)) > 1:
+            await m.answer("Hər iki rolunuz var. Əvvəlcə /start yazıb «Sürücüyəm» və ya «Kuryerəm» bölməsini açın, sonra canlı yer paylaşın.")
         else:
             await m.answer(
                 "Canlı yer yalnız təsdiqlənmiş sürücü və kuryerlər üçündür (/driver, /kuryer).\n"
@@ -1410,16 +1468,15 @@ def driver_card(d, o) -> str:
 @router.callback_query(F.data.startswith("acc:"))
 async def accept(cb: CallbackQuery):
     oid = int(cb.data[4:])
-    d = fetch("SELECT * FROM drivers WHERE user_id=? AND approved=1", (cb.from_user.id,))
-    if not d:
-        await cb.answer("Siz təsdiqlənmiş deyilsiniz. Botda qeydiyyatdan keçin: /start", show_alert=True)
-        return
     o0 = fetch("SELECT * FROM orders WHERE id=?", (oid,))
     if not o0:
         await cb.answer("Sifariş tapılmadı.", show_alert=True)
         return
-    if o0["kind"] != d["kind"]:
-        await cb.answer("Bu sifariş sizin xidmət növünüz üçün deyil.", show_alert=True)
+    d = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=? AND approved=1", (cb.from_user.id, o0["kind"]))
+    if not d:
+        msg = ("Bu sifariş sizin xidmət növünüz üçün deyil." if approved_kinds(cb.from_user.id)
+               else "Siz təsdiqlənmiş deyilsiniz. Botda qeydiyyatdan keçin: /start")
+        await cb.answer(msg, show_alert=True)
         return
     n, _ = execute("UPDATE orders SET status='accepted', driver_id=? WHERE id=? AND status='new'",
                    (d["user_id"], oid))
@@ -1536,7 +1593,7 @@ async def driver_cancel_do(cb: CallbackQuery):
     if not n:
         await cb.answer("Sifariş aktiv deyil.", show_alert=True)
         return
-    d = fetch("SELECT * FROM drivers WHERE user_id=?", (uid,))
+    d = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=?", (uid, o["kind"]))
     execute("INSERT INTO order_cancels(order_id,driver_id,who,created) VALUES(?,?,?,?)", (oid, uid, "driver", time.time()))
     cnt = recent_cancels(uid, "driver")
     await cb.message.edit_text("❌ Sifarişdən imtina etdiniz. Sifariş başqa sürücüyə təklif olunur.")
@@ -1756,8 +1813,8 @@ async def reg_plate(m: Message, state: FSMContext):
     approved = 1 if uid == ADMIN_ID else 0
     execute(
         "INSERT INTO drivers(user_id,name,phone,car,plate,approved,kind) VALUES(?,?,?,?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone, car=excluded.car, "
-        "plate=excluded.plate, approved=excluded.approved, kind=excluded.kind",
+        "ON CONFLICT(user_id, kind) DO UPDATE SET name=excluded.name, phone=excluded.phone, car=excluded.car, "
+        "plate=excluded.plate, approved=excluded.approved",
         (uid, data["name"], data["phone"], data["car"], m.text.strip(), approved, kind),
     )
     if approved:
@@ -1765,8 +1822,8 @@ async def reg_plate(m: Message, state: FSMContext):
         return
     await m.answer("Qeydiyyat göndərildi. Admin təsdiqləyəndən sonra /onlayn yazıb işə başlaya biləcəksiniz.")
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Təsdiq et", callback_data=f"appr:{uid}"),
-        InlineKeyboardButton(text="🚫 Rədd et", callback_data=f"deny:{uid}"),
+        InlineKeyboardButton(text="✅ Təsdiq et", callback_data=f"appr:{uid}:{kind}"),
+        InlineKeyboardButton(text="🚫 Rədd et", callback_data=f"deny:{uid}:{kind}"),
     ]])
     await m.bot.send_message(
         ADMIN_ID,
@@ -1782,14 +1839,16 @@ async def admin_decision(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
         await cb.answer("Yalnız admin.", show_alert=True)
         return
-    action, uid = cb.data.split(":")
-    uid = int(uid)
+    parts = cb.data.split(":")
+    action, uid = parts[0], int(parts[1])
+    kind = parts[2] if len(parts) > 2 else None           # köhnə düymələrdə rol yoxdur: hamısına aid olur
+    where, args = ("user_id=? AND kind=?", (uid, kind)) if kind else ("user_id=?", (uid,))
     if action == "appr":
-        execute("UPDATE drivers SET approved=1 WHERE user_id=?", (uid,))
+        execute(f"UPDATE drivers SET approved=1 WHERE {where}", args)
         await cb.message.edit_text(cb.message.html_text + "\n\n✅ Təsdiqləndi")
         note = "✅ Qeydiyyatınız təsdiqləndi. İşə başlamaq üçün canlı yer paylaşın (/onlayn)."
     else:
-        execute("UPDATE drivers SET approved=0, online=0 WHERE user_id=?", (uid,))
+        execute(f"UPDATE drivers SET approved=0, online=0 WHERE {where}", args)
         await cb.message.edit_text(cb.message.html_text + "\n\n🚫 Rədd edildi")
         note = "Qeydiyyatınız rədd edildi."
     try:
