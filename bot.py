@@ -233,17 +233,20 @@ def calc_price(km: float):
 
 
 async def route_km(plat, plon, dlat, dlon):
+    """Yol məsafəsi (km). Xəritə servisi cavab verməsə, düz xətt x 1,35 ilə təxmin edilir."""
+    body = {"coordinates": [[plon, plat], [dlon, dlat]], "radiuses": [-1, -1]}   # -1: istənilən məsafədən yola bağla
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"{ORS_BASE}/directions/driving-car",
-                              json={"coordinates": [[plon, plat], [dlon, dlat]]},
+            async with s.post(f"{ORS_BASE}/directions/driving-car", json=body,
                               headers={"Authorization": ORS_KEY},
                               timeout=aiohttp.ClientTimeout(total=20)) as r:
                 data = await r.json()
         return data["routes"][0]["summary"]["distance"] / 1000
     except Exception:
-        logging.exception("route error")
-        return None
+        logging.exception("route error; cavab: %s", locals().get("data"))
+    est = dist_km(plat, plon, dlat, dlon) * 1.35
+    logging.warning("marşrut hesablanmadı, düz xətt x1.35 təxmini: %.1f km", est)
+    return est
 
 
 # ---------- Ünvan axtarışı (Bakı daxilində, latın hərfləri ilə də) ----------
@@ -523,8 +526,11 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
+WAZE_BASE = os.environ.get("WAZE_BASE", "https://waze.com/ul").rstrip("?")
+
+
 def waze(lat, lon) -> str:
-    return f"https://waze.com/ul?ll={lat:.6f},{lon:.6f}&navigate=yes"
+    return f"{WAZE_BASE}?ll={lat:.6f},{lon:.6f}&navigate=yes"
 
 
 def fmt_kg(w) -> str:
@@ -542,15 +548,15 @@ def order_text(o, road_km=None) -> str:
     Fərdi mesajda götürülmə yerinin yanında mötərizədə sürücüdən yol məsafəsi yazılır."""
     near = f" ({fmt_dist(road_km)})" if road_km is not None else ""
     lines = [
-        f"<b>{kind_title(o['kind'])} sifarişi #{o['id']}</b>",
-        f"<a href=\"{waze(o['plat'], o['plon'])}\">Götürülmə yeri</a>{near}",
-        f"Ödəniş məbləği: {fmt_num(o['price'])} ₼",
+        f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['id']}</b>",
+        f"<a href=\"{waze(o['plat'], o['plon'])}\">📍Götürülmə yeri</a>{near} 👈",
+        f"💸 Ödəniş məbləği: {fmt_num(o['price'])} ₼",
     ]
     if o["note"]:
-        lines.append(f"Qeyd: {esc(o['note'])}")
+        lines.append(f"📝 Qeyd: {esc(o['note'])}")
     if o["weight"]:
-        lines.append(f"Təxmini çəki: {fmt_kg(o['weight'])} kq")
-    lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">Gediləcək yer</a>: {esc(o['dest_label'])}")
+        lines.append(f"⚖️ Təxmini çəki: {fmt_kg(o['weight'])} kq")
+    lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">🏁 Gediləcək yer</a>: {esc(o['dest_label'])}")
     lines.append(f"Məsafə: {fmt_num(o['km'])} km")
     return "\n".join(lines)
 
@@ -1065,7 +1071,8 @@ async def choose_service(cb: CallbackQuery):
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(text="🟢 Onlayn olanlar", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map?kind={kind}"))])
     await cb.message.edit_text(
-        f"{kind_title(kind)} çağırmaq üçün yerinizi göndərin. İstəsəniz əvvəlcə onlayn {what}lərə xəritədə baxın.",
+        f"{kind_title(kind)} çağırmaq üçün götürülmə yerini göndərin: 📍 düyməsi ilə öz yerinizi və ya 📎 → Yer ilə istənilən nöqtəni. "
+        f"İstəsəniz əvvəlcə onlayn {what}lərə xəritədə baxın.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
     )
     await cb.message.answer("📍 Yerinizi göndərmək üçün aşağıdakı düyməyə basın:", reply_markup=start_kb())
