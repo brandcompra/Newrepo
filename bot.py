@@ -26,6 +26,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -549,7 +550,7 @@ def order_text(o, road_km=None) -> str:
     near = f" ({fmt_dist(road_km)})" if road_km is not None else ""
     lines = [
         f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['id']}</b>",
-        f"<a href=\"{waze(o['plat'], o['plon'])}\">📍Götürülmə yeri</a>{near} 👈",
+        f"<a href=\"{waze(o['plat'], o['plon'])}\">📍 Götürülmə yeri</a>{near} 👈",
         f"💸 Ödəniş məbləği: {fmt_num(o['price'])} ₼",
     ]
     if o["note"]:
@@ -992,6 +993,20 @@ async def go_home(m: Message, state: FSMContext):
     await m.answer(ROLES_TEXT, reply_markup=role_kb())
 
 
+@router.my_chat_member()
+async def bot_membership(ev: ChatMemberUpdated):
+    """Bot qrupa əlavə olunanda/çıxarılanda adminə qrupun ID-sini göndərir."""
+    if ev.chat.type == ChatType.PRIVATE:
+        return
+    st = ev.new_chat_member.status
+    state = "əlavə olundu ✅" if st in ("member", "administrator") else "qrupdan çıxarıldı ❌"
+    try:
+        await ev.bot.send_message(
+            ADMIN_ID, f"Bot qrupa {state}\nQrup: {esc(ev.chat.title)}\nQrup ID: <code>{ev.chat.id}</code>")
+    except Exception:
+        logging.exception("admin notice failed")
+
+
 @router.message(Command("id"))
 async def get_id(m: Message):
     await m.answer(f"Chat ID: <code>{m.chat.id}</code>")
@@ -1323,8 +1338,13 @@ async def offer_order(bot, oid: int, exclude=()):
         execute("INSERT INTO notifs(order_id,chat_id,msg_id,driver_id) VALUES(?,?,?,NULL)",
                 (oid, group_for(o["kind"]), gmsg.message_id))
         group_ok = True
-    except Exception:
-        logging.exception("group send failed")
+    except Exception as e:
+        logging.error("group send failed: chat_id=%s xəta=%s: %s", group_for(o["kind"]), type(e).__name__, e)
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ Sifariş #{oid} qrupa göndərilə bilmədi.\n"
+                                   f"Qrup ID: <code>{group_for(o['kind'])}</code>\nXəta: {esc(type(e).__name__)}: {esc(e)}"[:900])
+        except Exception:
+            pass
     return sent, group_ok
 
 
