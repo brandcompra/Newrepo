@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
@@ -152,6 +152,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS order_cancels(
             order_id INTEGER, driver_id INTEGER, who TEXT, created REAL
         );
+        CREATE TABLE IF NOT EXISTS ratings(
+            order_id INTEGER, target TEXT, rater_id INTEGER, ratee_id INTEGER,
+            stars INTEGER, comment TEXT, created TEXT,
+            PRIMARY KEY (order_id, target)
+        );
         """
     )
     # köhnə bazadan yeniləmə (sütun varsa xəta verməz)
@@ -161,6 +166,8 @@ def init_db():
         ("orders", "kind", "TEXT DEFAULT 'taxi'"), ("orders", "note", "TEXT"),
         ("orders", "cust_msg_id", "INTEGER"), ("orders", "drv_msg_id", "INTEGER"),
         ("orders", "weight", "REAL"), ("orders", "recv_phone", "TEXT"),
+        ("orders", "stage", "TEXT"), ("orders", "arrived_at", "TEXT"), ("orders", "started_at", "TEXT"),
+        ("orders", "finished_at", "TEXT"), ("orders", "pickup_label", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -200,11 +207,19 @@ def dist_km(lat1, lon1, lat2, lon2) -> float:
 
 
 def fmt_num(x, nd=1) -> str:
-    return f"{x:.{nd}f}".replace(".", ",")
+    return f"{x:.{nd}f}"
+
+
+def fmt_money(x) -> str:
+    """Tam məbləğ qəpiksiz (3 ₼), qəpikli olanda iki rəqəmlə və nöqtə ilə (2.70 ₼)."""
+    x = round(float(x or 0), 2)
+    if abs(x - round(x)) < 0.005:
+        return f"{int(round(x))} ₼"
+    return f"{x:.2f} ₼"
 
 
 def fmt_dist(km: float) -> str:
-    """1 km-dən azdırsa metr (750 metr), çoxdursa km (1,3 km)."""
+    """1 km-dən azdırsa metr (750 metr), çoxdursa km (1.3 km)."""
     m = int(round(km * 100) * 10)
     if m < 1000:
         return f"{max(m, 10)} metr"
@@ -550,6 +565,29 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
+async def reverse_label(lat, lon):
+    """Koordinatın qısa ünvanı (profil tarixçəsi üçün). Alınmasa None."""
+    params = {"api_key": ORS_KEY, "point.lat": str(lat), "point.lon": str(lon), "size": "1", "boundary.country": "AZ"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(GEOCODE_URL.replace("/search", "/reverse"), params=params,
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json()
+        props = (data.get("features") or [{}])[0].get("properties", {}) or {}
+        label = props.get("label") or props.get("name") or ""
+        label = re.split(r",\s*(?:Baku|Bakı)\b", label)[0].strip(" ,")
+        return label[:60] or None
+    except Exception:
+        logging.warning("reverse geocode alınmadı")
+        return None
+
+
+async def fill_pickup_label(oid: int, lat, lon):
+    label = await reverse_label(lat, lon)
+    if label:
+        execute("UPDATE orders SET pickup_label=? WHERE id=?", (label, oid))
+
+
 WAZE_BASE = os.environ.get("WAZE_BASE", "https://waze.com/ul").rstrip("?")
 
 
@@ -574,14 +612,14 @@ def order_text(o, road_km=None) -> str:
     lines = [
         f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['id']}</b>",
         f"<a href=\"{waze(o['plat'], o['plon'])}\">📍 Götürülmə yeri</a>{near} 👈",
-        f"💸 Ödəniş məbləği: {fmt_num(o['price'])} ₼",
+        f"💸 Ödəniş məbləği: {fmt_money(o['price'])}",
     ]
     if o["note"]:
         lines.append(f"📝 Qeyd: {esc(o['note'])}")
     if o["weight"]:
         lines.append(f"⚖️ Təxmini çəki: {fmt_kg(o['weight'])} kq")
     lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">🏁 Gediləcək yer</a>: {esc(o['dest_label'])}")
-    lines.append(f"Məsafə: {fmt_num(o['km'])} km")
+    lines.append(f"Məsafə: {fmt_dist(o['km'])}")
     return "\n".join(lines)
 
 
@@ -604,6 +642,7 @@ def customer_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚕 Taksi çağır", callback_data="order:taxi")],
         [InlineKeyboardButton(text="🛵 Kuryer çağır", callback_data="order:courier")],
+        [InlineKeyboardButton(text="📋 Sifarişlərim", callback_data="my")],
     ])
 
 
@@ -611,9 +650,35 @@ BACK_TEXT = "🏠 Əvvələ qayıt"
 ROLES_TEXT = "Salam 👋 Kimsiniz?"
 
 
-def home_kb():
-    """Aşağıda daimi duran düymə."""
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BACK_TEXT)]], resize_keyboard=True, is_persistent=True)
+def home_row():
+    return [InlineKeyboardButton(text=BACK_TEXT, callback_data="home")]
+
+
+def with_home(rows=None) -> InlineKeyboardMarkup:
+    """Mesajın düymələrinin ən sonuna «Əvvələ qayıt» əlavə edir."""
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in (rows or [])] + [home_row()])
+
+
+def kb_home(kb=None) -> InlineKeyboardMarkup:
+    """Hazır inline klaviaturanın (və ya heç nəyin) sonuna «Əvvələ qayıt» qoyur."""
+    return with_home(kb.inline_keyboard if kb is not None else None)
+
+
+def start_kb():
+    """Yalnız WEBAPP_URL yoxdursa: köhnə üsul (aşağıda daimi «Yerimi göndər» düyməsi)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)], [KeyboardButton(text=BACK_TEXT)]],
+        resize_keyboard=True, is_persistent=True,
+    )
+
+
+async def drop_reply_kb(target: Message):
+    """Köhnə daimi klaviaturanı (aşağıdakı düymə sırası) bir dəfə silir."""
+    try:
+        tmp = await target.answer("…", reply_markup=ReplyKeyboardRemove())
+        await tmp.delete()
+    except Exception:
+        pass
 
 
 def customer_phone(uid: int):
@@ -667,44 +732,65 @@ async def next_order_step(m: Message, uid: int, uname: str, p: dict):
         p["uname"] = uname
         if WEBAPP_URL:
             own = customer_phone(uid) or ""
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            kb = with_home([[InlineKeyboardButton(
                 text="📱 Nömrələri yaz",
                 web_app=WebAppInfo(url=f"{WEBAPP_URL}/phones?own={own.replace('+', '%2B')}"))]])
             await m.answer("📱 Aşağıdakı düyməyə basın, açılan səhifədə iki nömrəni yazıb göndərin.\n\n"
                            "Səhifə açılmasa, nömrələri bura alt-alta yazın:\n"
                            "1. Sizin nömrəniz\n2. Bağlamanı qəbul edən şəxsin nömrəsi", reply_markup=kb)
         else:
-            await m.answer(PHONES_ASK)
+            await m.answer(PHONES_ASK, reply_markup=with_home())
         return
     if not customer_phone(uid):
         p["await_phone"] = True
-        await m.answer(PHONE_ASK)
+        await m.answer(PHONE_ASK, reply_markup=with_home())
         return
     pending.pop(uid, None)
     await dispatch_order(m.bot, uid, uname, p)
 
 
-def start_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)],
-                  [KeyboardButton(text=BACK_TEXT)]],
-        resize_keyboard=True, is_persistent=True,
-    )
-
-
-def order_customer_kb(oid: int) -> InlineKeyboardMarkup:
+def order_customer_kb(oid: int, stage=None) -> InlineKeyboardMarkup:
     rows = []
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(text="📍 İzlə", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map?order={oid}"))])
-    rows.append([InlineKeyboardButton(text="🚫 İmtina et", callback_data=f"cxa:{oid}")])
+    if stage != "started":                      # gediş başlayandan sonra müştəri ləğv edə bilmir
+        rows.append([InlineKeyboardButton(text="🚫 İmtina et", callback_data=f"cxa:{oid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def order_driver_kb(oid: int) -> InlineKeyboardMarkup:
+def order_driver_kb(o) -> InlineKeyboardMarkup:
+    """Sürücünün/kuryerin sifariş mesajındakı düymələr mərhələyə görədir:
+    qəbul -> Çatdım -> Gedişə başla -> Sifarişi bitir."""
+    oid, stage = o["id"], o["stage"]
+    if stage == "started":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Sifarişi bitir · {fmt_money(o['price'])}", callback_data=f"fin:{oid}")],
+        ])
+    if stage == "arrived":
+        go = "🛵 Çatdırılmaya başla" if o["kind"] == "courier" else "▶️ Gedişə başla"
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=go, callback_data=f"go:{oid}")],
+            [InlineKeyboardButton(text="🚫 İmtina et", callback_data=f"dcx:{oid}")],
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Sifariş bitdi", callback_data=f"fin:{oid}")],
+        [InlineKeyboardButton(text="📍 Çatdım", callback_data=f"arr:{oid}")],
         [InlineKeyboardButton(text="🚫 İmtina et", callback_data=f"dcx:{oid}")],
     ])
+
+
+def driver_dm_text(o) -> str:
+    """Sifarişi qəbul edənin şəxsi mesajı (mərhələ sonda qısa sətirlə göstərilir)."""
+    txt = ("✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
+           + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
+           + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else "")
+           + (f"\nQəbul edən şəxsin telefonu: {esc(o['recv_phone'])}" if o["recv_phone"] else ""))
+    if o["status"] == "done":
+        txt += "\n\n✅ Tamamlandı"
+    elif o["stage"] == "started":
+        txt += "\n\n" + ("🛵 Çatdırılma davam edir" if o["kind"] == "courier" else "▶️ Gediş davam edir")
+    elif o["stage"] == "arrived":
+        txt += "\n\n📍 Çatdınız, müştəri xəbərdar edildi"
+    return txt
 
 
 def set_active_role(uid: int, kind: str):
@@ -851,7 +937,9 @@ function track(){
     if (d.driver) {
       pin(d.driver.lat, d.driver.lon, EMO[d.kind] || '🚕').addTo(layer);
       pts.push([d.driver.lat, d.driver.lon]);
-      statusEl.textContent = (d.kind === 'courier' ? 'Kuryer' : 'Sürücü') + ' yoldadır';
+      var who = (d.kind === 'courier' ? 'Kuryer' : 'Sürücü');
+      statusEl.textContent = d.stage === 'arrived' ? (who + ' çatdı, sizi gözləyir') :
+                             d.stage === 'started' ? (d.kind === 'courier' ? 'Çatdırılma gedir' : 'Gediş gedir') : (who + ' yoldadır');
       hintEl.textContent = d.driver.age > 60 ? ('Yer ' + d.driver.age + ' saniyə əvvəl yenilənib') : 'Canlı izləmə';
     } else {
       statusEl.textContent = 'Yer hələ gəlməyib';
@@ -910,7 +998,7 @@ async def api_track(request):
     if d and d["lat"] is not None:
         drv = {"lat": d["lat"], "lon": d["lon"], "age": int(time.time() - (d["loc_time"] or 0))}
     return web.json_response({
-        "status": "accepted", "kind": o["kind"], "driver": drv,
+        "status": "accepted", "kind": o["kind"], "driver": drv, "stage": o["stage"],
         "pickup": {"lat": o["plat"], "lon": o["plon"]},
         "dest": {"lat": o["dlat"], "lon": o["dlon"]},
     }, headers={"Cache-Control": "no-store"})
@@ -975,6 +1063,14 @@ BOT_REF = {}
 _tasks: set = set()
 
 
+def spawn(coro):
+    """Arxa planda işləyən tapşırıq (yığılıb silinməsin deyə saxlanılır)."""
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return t
+
+
 async def phones_page(request):
     return web.Response(text=PHONES_PAGE, content_type="text/html", headers={"Cache-Control": "no-store"})
 
@@ -999,9 +1095,127 @@ async def api_phones(request):
     p["recv_phone"] = recv
     p.pop("await_phones", None)
     pending.pop(uid, None)
-    t = asyncio.create_task(dispatch_order(BOT_REF["bot"], uid, uname, p))
-    _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
+    spawn(dispatch_order(BOT_REF["bot"], uid, uname, p))
+    return web.json_response({"ok": True})
+
+
+LOCATE_PAGE = """<!doctype html>
+<html lang="az"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Yerim</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+:root{--bg:#fff;--fg:#111827;--bar:#f3f4f6;--mut:#6b7280;--btn:#2563eb}
+@media (prefers-color-scheme: dark){:root{--bg:#111827;--fg:#f3f4f6;--bar:#1f2937;--mut:#9ca3af}}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#bar{position:fixed;top:0;left:0;right:0;z-index:1000;box-sizing:border-box;height:62px;padding:10px 16px;background:var(--bar);box-shadow:0 1px 4px rgba(0,0,0,.25)}
+#status{font-weight:600}
+#hint{color:var(--mut);font-size:12px;margin-top:2px}
+#map{position:absolute;top:62px;bottom:72px;left:0;right:0}
+#foot{position:fixed;left:0;right:0;bottom:0;z-index:1000;box-sizing:border-box;height:72px;padding:10px 16px;background:var(--bar)}
+button{width:100%;height:100%;font-size:17px;font-weight:600;border:0;border-radius:10px;background:var(--btn);color:#fff}
+button:disabled{opacity:.5}
+.pin{font-size:30px;line-height:34px;text-align:center;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45))}
+</style></head><body>
+<div id="bar"><div id="status">Yeriniz təyin edilir…</div><div id="hint"></div></div>
+<div id="map"></div>
+<div id="foot"><button id="go" disabled>✅ Təsdiq et</button></div>
+<script>
+(function(){
+var tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { try { tg.ready(); tg.expand(); } catch(e){} }
+var statusEl = document.getElementById('status'), hintEl = document.getElementById('hint'), btn = document.getElementById('go');
+var map = L.map('map').setView([40.4093, 49.8671], 12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap'}).addTo(map);
+var marker = null, point = null;
+function setPoint(lat, lon, move){
+  point = {lat: lat, lon: lon};
+  if (!marker) {
+    marker = L.marker([lat, lon], {draggable: true, icon: L.divIcon({className: 'pin', html: '📍', iconSize: [34, 34], iconAnchor: [17, 32]})}).addTo(map);
+    marker.on('dragend', function(){ var p = marker.getLatLng(); point = {lat: p.lat, lon: p.lng}; });
+  } else { marker.setLatLng([lat, lon]); }
+  if (move) map.setView([lat, lon], 17);
+  btn.disabled = false;
+}
+map.on('click', function(e){ setPoint(e.latlng.lat, e.latlng.lng, false); statusEl.textContent = 'Nöqtə seçildi'; hintEl.textContent = 'İstəsəniz nişanı sürüşdürüb dəqiqləşdirin'; });
+function getPos(){
+  return new Promise(function(res){
+    var done = false;
+    function fin(v){ if (!done) { done = true; res(v); } }
+    setTimeout(function(){ fin(null); }, 15000);
+    function viaBrowser(){
+      if (!navigator.geolocation) return fin(null);
+      navigator.geolocation.getCurrentPosition(
+        function(p){ fin({lat: p.coords.latitude, lon: p.coords.longitude}); },
+        function(){ fin(null); }, {enableHighAccuracy: true, timeout: 12000});
+    }
+    var lm = tg && tg.LocationManager;
+    if (lm && lm.init) {
+      try {
+        lm.init(function(){
+          if (lm.isLocationAvailable) {
+            lm.getLocation(function(d){ if (d && d.latitude != null) fin({lat: d.latitude, lon: d.longitude}); else viaBrowser(); });
+          } else viaBrowser();
+        });
+      } catch(e) { viaBrowser(); }
+    } else { viaBrowser(); }
+  });
+}
+getPos().then(function(p){
+  if (p) {
+    setPoint(p.lat, p.lon, true);
+    statusEl.textContent = 'Yeriniz tapıldı';
+    hintEl.textContent = 'Düzdürsə «Təsdiq et»ə basın. Dəyişmək üçün xəritədə toxunun.';
+  } else {
+    statusEl.textContent = 'Yeri tapa bilmədik. Xəritədə nöqtəni özünüz seçin';
+    hintEl.textContent = 'Xəritəyə toxunub götürülmə nöqtəsini göstərin';
+  }
+});
+btn.onclick = function(){
+  if (!point) return;
+  btn.disabled = true;
+  fetch('/api/pickup', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Init-Data': tg ? tg.initData : ''},
+        body: JSON.stringify(point)})
+  .then(function(r){ return r.json().then(function(j){ return {s: r.status, j: j}; }); })
+  .then(function(x){
+    if (x.s === 200) { if (tg) tg.close(); else statusEl.textContent = 'Göndərildi ✅'; return; }
+    btn.disabled = false;
+    statusEl.textContent = x.j.error === 'expired' ? 'Sifariş vaxtı keçib. Botda yenidən sifariş verin.' : 'Xəta baş verdi. Yenidən cəhd edin.';
+  })
+  .catch(function(){ btn.disabled = false; statusEl.textContent = 'Bağlantı xətası. Yenidən cəhd edin.'; });
+};
+})();
+</script></body></html>"""
+
+
+async def locate_page(request):
+    return web.Response(text=LOCATE_PAGE, content_type="text/html", charset="utf-8", headers={"Cache-Control": "no-store"})
+
+
+async def api_pickup(request):
+    """Mini Appdan gələn götürülmə nöqtəsi: sifarişi davam etdirir (təyinat soruşulur)."""
+    uid = _auth(request)
+    if uid is None:
+        return web.json_response({"error": "auth"}, status=401)
+    try:
+        body = await request.json()
+        lat, lon = float(body["lat"]), float(body["lon"])
+    except Exception:
+        return web.json_response({"error": "bad"}, status=400)
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+        return web.json_response({"error": "bad"}, status=400)
+    p = pending.get(uid)
+    busy = p and any(k in p for k in ("dlat", "await_phone", "await_phones", "await_weight"))
+    if not p or not p.get("kind") or busy:
+        return web.json_response({"error": "expired"}, status=409)
+    bot = BOT_REF["bot"]
+
+    async def send(text, reply_markup=None):
+        await bot.send_message(uid, text, reply_markup=reply_markup)
+
+    await set_pickup(send, uid, p["kind"], lat, lon)
     return web.json_response({"ok": True})
 
 
@@ -1011,6 +1225,7 @@ async def start_web():
         web.get("/", web_health), web.get("/map", web_page),
         web.get("/api/online", api_online), web.get("/api/track", api_track),
         web.get("/phones", phones_page), web.post("/api/phones", api_phones),
+        web.get("/locate", locate_page), web.post("/api/pickup", api_pickup),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1030,15 +1245,26 @@ LIVE_HELP = (
 async def start(m: Message, state: FSMContext):
     await state.clear()
     pending.pop(m.from_user.id, None)
-    await m.answer("Aşağıdakı «Əvvələ qayıt» düyməsi istənilən vaxt əsas menyuya qaytarır.", reply_markup=home_kb())
+    await drop_reply_kb(m)          # köhnə versiyadan qalan aşağıdakı düymə sırasını silir
     await m.answer(ROLES_TEXT, reply_markup=role_kb())
 
 
 @router.message(F.text == BACK_TEXT, F.chat.type == ChatType.PRIVATE)
 async def go_home(m: Message, state: FSMContext):
+    """Köhnə daimi düymə hələ qalıbsa: menyuya qaytarır və həmin düyməni silir."""
     await state.clear()
     pending.pop(m.from_user.id, None)
+    await drop_reply_kb(m)
     await m.answer(ROLES_TEXT, reply_markup=role_kb())
+
+
+@router.callback_query(F.data == "home")
+async def cb_home(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pending.pop(cb.from_user.id, None)
+    awaiting_comment.pop(cb.from_user.id, None)
+    await cb.message.answer(ROLES_TEXT, reply_markup=role_kb())
+    await cb.answer()
 
 
 @router.my_chat_member()
@@ -1081,27 +1307,33 @@ async def role_worker(cb: CallbackQuery):
              InlineKeyboardButton(text="🔴 Oflayn", callback_data="off")]]
     if not registered:
         rows.append([InlineKeyboardButton(text="📝 Qeydiyyat", callback_data=f"reg:{kind}")])
-    await cb.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    elif d["approved"]:
+        rows.append([InlineKeyboardButton(text="👤 Profilim", callback_data=f"prof:{kind}")])
+    await cb.message.edit_text("\n".join(lines), reply_markup=with_home(rows))
     await cb.answer()
 
 
 async def _go_online(target: Message, uid: int):
     if not approved_kinds(uid):
-        await target.answer("Əvvəlcə qeydiyyatdan keçin (/driver sürücü, /kuryer kuryer) və admin təsdiqini gözləyin.")
+        await target.answer("Əvvəlcə qeydiyyatdan keçin (/driver sürücü, /kuryer kuryer) və admin təsdiqini gözləyin.",
+                            reply_markup=with_home())
         return
     kind = pick_kind(uid)
     if not kind:
-        await target.answer("Hər iki rolunuz var. Əvvəlcə /start yazıb «Sürücüyəm» və ya «Kuryerəm» bölməsini açın, sonra işə başlayın.")
+        await target.answer("Hər iki rolunuz var. Əvvəlcə /start yazıb «Sürücüyəm» və ya «Kuryerəm» bölməsini açın, sonra işə başlayın.",
+                            reply_markup=with_home())
         return
     role = "kuryer" if kind == "courier" else "sürücü"
-    await target.answer(f"🟢 {role.capitalize()} kimi işə başlamaq üçün canlı yerinizi göndərin:\n\n" + LIVE_HELP)
+    await target.answer(f"🟢 {role.capitalize()} kimi işə başlamaq üçün canlı yerinizi göndərin:\n\n" + LIVE_HELP,
+                        reply_markup=with_home())
 
 
 async def _go_offline(target: Message, uid: int):
     execute("UPDATE drivers SET online=0 WHERE user_id=?", (uid,))
     await target.answer(
         "🔴 Oflayn oldunuz. Sifarişlər gəlməyəcək.\n"
-        "Telegram-da canlı yer paylaşımını da dayandırın. Yenidən başlamaq üçün canlı yer paylaşın."
+        "Telegram-da canlı yer paylaşımını da dayandırın. Yenidən başlamaq üçün canlı yer paylaşın.",
+        reply_markup=with_home(),
     )
 
 
@@ -1129,8 +1361,27 @@ async def cmd_off(m: Message):
 
 @router.callback_query(F.data == "role:customer")
 async def role_customer(cb: CallbackQuery):
-    await cb.message.edit_text("Nə lazımdır?", reply_markup=customer_menu_kb())
+    await cb.message.edit_text("Nə lazımdır?", reply_markup=kb_home(customer_menu_kb()))
     await cb.answer()
+
+
+def loc_rows(kind: str):
+    """«Yerimi göndər» (Mini App) və «Onlayn olanlar» düymələri."""
+    rows = []
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton(text="📍 Yerimi göndər", web_app=WebAppInfo(url=f"{WEBAPP_URL}/locate"))])
+        rows.append([InlineKeyboardButton(text="🟢 Onlayn olanlar", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map?kind={kind}"))])
+    return rows
+
+
+async def ask_location(target: Message, kind: str, first: str = ""):
+    """Götürülmə yerini istəyir. Düymə mesajın altındadır, «Əvvələ qayıt» ən sonda.
+    WEBAPP_URL yoxdursa köhnə üsula (aşağıdakı düymə) qayıdır."""
+    ask = "📍 Yerinizi göndərmək üçün aşağıdakı düyməyə basın:"
+    if WEBAPP_URL:
+        await target.answer((first + "\n\n" if first else "") + ask, reply_markup=with_home(loc_rows(kind)))
+    else:
+        await target.answer((first + "\n\n" if first else "") + ask, reply_markup=start_kb())
 
 
 @router.callback_query(F.data.in_({"order:taxi", "order:courier"}))
@@ -1138,19 +1389,29 @@ async def choose_service(cb: CallbackQuery):
     kind = "courier" if cb.data == "order:courier" else "taxi"
     pending[cb.from_user.id] = {"kind": kind}
     what = "kuryer" if kind == "courier" else "taksi"
-    rows = []
+    first = (f"{kind_title(kind)} çağırmaq üçün götürülmə yerini göndərin: 📍 düyməsi ilə öz yerinizi və ya 📎 → Yer ilə "
+             f"istənilən nöqtəni. İstəsəniz əvvəlcə onlayn {what}lərə xəritədə baxın.")
     if WEBAPP_URL:
-        rows.append([InlineKeyboardButton(text="🟢 Onlayn olanlar", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map?kind={kind}"))])
-    await cb.message.edit_text(
-        f"{kind_title(kind)} çağırmaq üçün götürülmə yerini göndərin: 📍 düyməsi ilə öz yerinizi və ya 📎 → Yer ilə istənilən nöqtəni. "
-        f"İstəsəniz əvvəlcə onlayn {what}lərə xəritədə baxın.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
-    )
-    await cb.message.answer("📍 Yerinizi göndərmək üçün aşağıdakı düyməyə basın:", reply_markup=start_kb())
+        await cb.message.edit_text(first + "\n\n📍 Yerinizi göndərmək üçün aşağıdakı düyməyə basın:",
+                                   reply_markup=with_home(loc_rows(kind)))
+    else:
+        await cb.message.edit_text(first, reply_markup=with_home())
+        await ask_location(cb.message, kind)
     await cb.answer()
 
 
 # ---------- Müştəri: yer, ünvan, qiymət ----------
+async def set_pickup(send, uid: int, kind: str, lat: float, lon: float):
+    """Götürülmə nöqtəsini yadda saxlayır və təyinatı soruşur. send(text, reply_markup=...) mesaj göndərən funksiyadır."""
+    pending[uid] = {"kind": kind, "plat": lat, "plon": lon}
+    if kind == "courier":
+        ask = "Bağlama hara göndəriləcək? Ünvanı yazın və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
+    else:
+        ask = ("Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
+               "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.")
+    await send(ask, reply_markup=with_home())
+
+
 @router.message(F.location, F.chat.type == ChatType.PRIVATE, StateFilter(None))
 async def on_location(m: Message):
     uid = m.from_user.id
@@ -1175,16 +1436,12 @@ async def on_location(m: Message):
     p = pending.get(uid)
     kind = (p or {}).get("kind")
     if not kind:
-        await m.answer("Nə lazımdır?", reply_markup=customer_menu_kb())
+        await m.answer("Nə lazımdır?", reply_markup=kb_home(customer_menu_kb()))
         return
     if "plat" not in p:
-        pending[uid] = {"kind": kind, "plat": loc.latitude, "plon": loc.longitude}
-        if kind == "courier":
-            ask = "Bağlama hara göndəriləcək? Ünvanı yazın və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
-        else:
-            ask = ("Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
-                   "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.")
-        await m.answer(ask, reply_markup=home_kb())
+        if not WEBAPP_URL:
+            await drop_reply_kb(m)       # köhnə üsulda aşağıdakı «Yerimi göndər» düyməsi silinir
+        await set_pickup(m.answer, uid, kind, loc.latitude, loc.longitude)
     else:
         await quote(m, p, loc.latitude, loc.longitude, "Xəritədən seçilmiş nöqtə")
 
@@ -1199,10 +1456,13 @@ async def on_text(m: Message):
     uid = m.from_user.id
     p = pending.get(uid)
 
+    if uid in awaiting_comment and await save_comment(m):
+        return
+
     if p and p.get("await_phone"):
         phone = parse_phone(m.text)
         if not phone:
-            await m.answer("Nömrə düzgün deyil. Məsələn: 0501234567")
+            await m.answer("Nömrə düzgün deyil. Məsələn: 0501234567", reply_markup=with_home())
             return
         execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
                 "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone",
@@ -1215,7 +1475,7 @@ async def on_text(m: Message):
     if p and p.get("await_phones"):
         two = parse_two_phones(m.text)
         if not two:
-            await m.answer("Hər iki nömrəni alt-alta yazın, məsələn:\n0501234567\n0557654321")
+            await m.answer("Hər iki nömrəni alt-alta yazın, məsələn:\n0501234567\n0557654321", reply_markup=with_home())
             return
         own, recv = two
         execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
@@ -1230,10 +1490,11 @@ async def on_text(m: Message):
     if p and p.get("await_weight"):
         w = parse_weight(m.text)
         if w is None:
-            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 2.5")
+            await m.answer("Çəkini rəqəmlə yazın, məsələn: 2 və ya 2.5", reply_markup=with_home())
             return
         if w > MAX_KG:
-            await m.answer(f"Bağlamanın çəkisi {fmt_kg(MAX_KG)} kq-dan çox ola bilməz. Daha yüngül çəki yazın.")
+            await m.answer(f"Bağlamanın çəkisi {fmt_kg(MAX_KG)} kq-dan çox ola bilməz. Daha yüngül çəki yazın.",
+                           reply_markup=with_home())
             return
         p["weight"] = w
         p.pop("await_weight", None)
@@ -1242,7 +1503,7 @@ async def on_text(m: Message):
 
     if not p or "plat" not in p:
         if p and p.get("kind") and "plat" not in p:
-            await m.answer("Əvvəlcə yerinizi göndərin 👇", reply_markup=start_kb())
+            await ask_location(m, p["kind"], "Əvvəlcə yerinizi göndərin 👇")
         else:
             await m.answer(ROLES_TEXT, reply_markup=role_kb())
         return
@@ -1254,7 +1515,8 @@ async def on_text(m: Message):
     if not cands:
         await m.answer(
             "Bakı daxilində bu ünvanı tapa bilmədim. Daha dəqiq yazın "
-            "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
+            "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.",
+            reply_markup=with_home(),
         )
         return
     best = cands[0]
@@ -1262,7 +1524,7 @@ async def on_text(m: Message):
         await quote(m, p, best["lat"], best["lon"], best["label"])
         return
     p["cands"] = cands
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = with_home([
         [InlineKeyboardButton(text=f"{i + 1}. {c['label'][:55]}", callback_data=f"g:{i}")]
         for i, c in enumerate(cands)
     ])
@@ -1282,11 +1544,11 @@ def parse_weight(text: str):
 async def quote(m: Message, p: dict, dlat, dlon, label):
     if p.get("kind") == "courier" and "weight" not in p:   # kuryerdə qiymətdən əvvəl çəki soruşulur
         p.update(dlat=dlat, dlon=dlon, label=label, await_weight=True)
-        await m.answer(WEIGHT_ASK)
+        await m.answer(WEIGHT_ASK, reply_markup=with_home())
         return
     km = await route_km(p["plat"], p["plon"], dlat, dlon)
     if km is None:
-        await m.answer("Marşrutu hesablaya bilmədim. Bir az sonra yenidən cəhd edin.")
+        await m.answer("Marşrutu hesablaya bilmədim. Bir az sonra yenidən cəhd edin.", reply_markup=with_home())
         return
     price, mult = calc_price(km)
     heavy = p.get("weight", 0) > HEAVY_KG
@@ -1294,7 +1556,7 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
         price = round(price * HEAVY_MULT, 1)
     p.update(dlat=dlat, dlon=dlon, label=label, km=km, price=price, mult=mult, heavy=heavy)
     if km > FAR_KM and not p.get("far_ok"):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb = with_home([
             [InlineKeyboardButton(text="✅ Bəli, davam et", callback_data="q_far")],
             [InlineKeyboardButton(text="✏️ Başqa ünvan yaz", callback_data="q_edit")],
         ])
@@ -1307,11 +1569,11 @@ async def quote(m: Message, p: dict, dlat, dlon, label):
 async def show_quote(m: Message, p: dict):
     price, mult, label = p["price"], p.get("mult", 1), p["label"]
     note = f" (pik saat ×{fmt_num(PEAK_MULT)})" if mult > 1 else ""
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
+    kb = with_home([[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data="q_ok"),
         InlineKeyboardButton(text="❌ Ləğv et", callback_data="q_no"),
     ], [InlineKeyboardButton(text="✏️ Ünvanı dəyiş", callback_data="q_edit")]])
-    await m.answer(f"🏁 Təyinat: {esc(label)}\n💰 Qiymət: <b>{fmt_num(price)} ₼</b>{note}", reply_markup=kb)
+    await m.answer(f"🏁 Təyinat: {esc(label)}\n💰 Qiymət: <b>{fmt_money(price)}</b>{note}", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("g:"))
@@ -1349,14 +1611,15 @@ async def quote_edit(cb: CallbackQuery):
     for k in ("dlat", "dlon", "label", "km", "price", "cands", "far_ok", "mult", "heavy"):
         p.pop(k, None)
     await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.answer("Yeni təyinat ünvanını yazın və ya 📎 → Yer ilə xəritədən nöqtə göndərin.")
+    await cb.message.answer("Yeni təyinat ünvanını yazın və ya 📎 → Yer ilə xəritədən nöqtə göndərin.",
+                            reply_markup=with_home())
     await cb.answer()
 
 
 @router.callback_query(F.data == "q_no")
 async def quote_cancel(cb: CallbackQuery):
     pending.pop(cb.from_user.id, None)
-    await cb.message.edit_text("Ləğv edildi. Yenidən sifariş üçün /start")
+    await cb.message.edit_text("Ləğv edildi.", reply_markup=with_home())
     await cb.answer()
 
 
@@ -1417,10 +1680,12 @@ async def dispatch_order(bot, uid: int, uname: str, p: dict):
         (uid, uname, p.get("kind", "taxi"), p["plat"], p["plon"], p["dlat"], p["dlon"], p["label"],
          p["km"], p["price"], p.get("note", ""), p.get("weight"), p.get("recv_phone"), datetime.now(TZ).isoformat()),
     )
+    spawn(fill_pickup_label(oid, p["plat"], p["plon"]))       # tarixçə üçün götürülmə ünvanı (arxa planda)
     sent, group_ok = await offer_order(bot, oid)
     if sent == 0 and not group_ok:
         execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
-        await bot.send_message(uid, "😕 Sifarişi çatdıra bilmədim. Bir az sonra yenidən cəhd edin: /start")
+        await bot.send_message(uid, "😕 Sifarişi çatdıra bilmədim. Bir az sonra yenidən cəhd edin.",
+                               reply_markup=with_home())
         return
     cour = p.get("kind") == "courier"
     parts = []
@@ -1430,7 +1695,7 @@ async def dispatch_order(bot, uid: int, uname: str, p: dict):
         parts.append("kuryerlər qrupuna" if cour else "sürücülər qrupuna")
     await bot.send_message(
         uid, f"✅ Sifariş #{oid} {' və '.join(parts)} göndərildi. Qəbul edən kimi məlumat gələcək.",
-        reply_markup=cancel_kb(oid),
+        reply_markup=kb_home(cancel_kb(oid)),
     )
 
 
@@ -1455,14 +1720,16 @@ async def customer_cancel(cb: CallbackQuery):
 
 # ---------- Sürücü: qəbul / imtina / bitirmə ----------
 def driver_card(d, o) -> str:
-    price = f"💰 {fmt_num(o['price'])} ₼"
+    price = f"💸 {fmt_money(o['price'])}"
+    avg, cnt = rating_of_worker(d["user_id"], o["kind"])
+    star = [f"⭐ {avg:.1f}"] if cnt >= MIN_RATINGS_SHOWN else []
     if o["kind"] == "courier":
         lines = ["✅ <b>Kuryer tapıldı!</b>", f"👤 {esc(d['name'])}", f"📞 {esc(d['phone'])}", f"🛵 {esc(d['car'])}"]
         if d["plate"] and norm(d["plate"]) not in ("yoxdur", "-"):
             lines.append(f"🔢 {esc(d['plate'])}")
-        return "\n".join(lines + [price])
+        return "\n".join(lines + star + [price])
     return "\n".join(["✅ <b>Sürücü tapıldı!</b>", f"👤 {esc(d['name'])}", f"📞 {esc(d['phone'])}",
-                      f"🚗 {esc(d['car'])}", f"🔢 {esc(d['plate'])}", price])
+                      f"🚗 {esc(d['car'])}", f"🔢 {esc(d['plate'])}"] + star + [price])
 
 
 @router.callback_query(F.data.startswith("acc:"))
@@ -1500,14 +1767,7 @@ async def accept(cb: CallbackQuery):
     cmsg = await cb.bot.send_message(o["customer_id"], driver_card(d, o), reply_markup=order_customer_kb(oid))
     execute("UPDATE orders SET cust_msg_id=? WHERE id=?", (cmsg.message_id, oid))
     try:
-        dmsg = await cb.bot.send_message(
-            d["user_id"],
-            "✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
-            + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
-            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else "")
-            + (f"\nQəbul edən şəxsin telefonu: {esc(o['recv_phone'])}" if o["recv_phone"] else ""),
-            reply_markup=order_driver_kb(oid),
-        )
+        dmsg = await cb.bot.send_message(d["user_id"], driver_dm_text(o), reply_markup=order_driver_kb(o))
         execute("UPDATE orders SET drv_msg_id=? WHERE id=?", (dmsg.message_id, oid))
         await cb.answer("Qəbul etdiniz ✅")
     except Exception:
@@ -1526,27 +1786,200 @@ async def reject(cb: CallbackQuery):
     await cb.answer("İmtina etdiniz.")
 
 
+async def _worker_order(cb: CallbackQuery, oid: int):
+    """Düyməni basan sürücü/kuryerin aktiv sifarişi (yoxsa None)."""
+    o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
+    if not o or o["status"] != "accepted" or o["driver_id"] != cb.from_user.id:
+        await cb.answer("Sifariş aktiv deyil.", show_alert=True)
+        return None
+    return o
+
+
+async def _refresh_driver_msg(cb: CallbackQuery, oid: int):
+    o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
+    try:
+        await cb.message.edit_text(driver_dm_text(o), reply_markup=order_driver_kb(o) if o["status"] == "accepted" else None)
+    except Exception:
+        logging.warning("driver message edit failed for order %s", oid)
+    return o
+
+
+@router.callback_query(F.data.startswith("arr:"))
+async def arrived(cb: CallbackQuery):
+    oid = int(cb.data[4:])
+    if not await _worker_order(cb, oid):
+        return
+    n, _ = execute("UPDATE orders SET stage='arrived', arrived_at=? WHERE id=? AND status='accepted' "
+                   "AND driver_id=? AND stage IS NULL", (datetime.now(TZ).isoformat(), oid, cb.from_user.id))
+    if not n:
+        await cb.answer("Bu mərhələ artıq keçilib.", show_alert=True)
+        return
+    o = await _refresh_driver_msg(cb, oid)
+    who = "Kuryer" if o["kind"] == "courier" else "Sürücü"
+    try:
+        await cb.bot.send_message(o["customer_id"], f"📍 {who} çatdı, sizi gözləyir.")
+    except Exception:
+        logging.warning("customer %s notify failed", o["customer_id"])
+    await cb.answer("Müştəri xəbərdar edildi ✅")
+
+
+@router.callback_query(F.data.startswith("go:"))
+async def trip_start(cb: CallbackQuery):
+    oid = int(cb.data[3:])
+    if not await _worker_order(cb, oid):
+        return
+    n, _ = execute("UPDATE orders SET stage='started', started_at=? WHERE id=? AND status='accepted' "
+                   "AND driver_id=? AND stage='arrived'", (datetime.now(TZ).isoformat(), oid, cb.from_user.id))
+    if not n:
+        await cb.answer("Bu mərhələ artıq keçilib.", show_alert=True)
+        return
+    o = await _refresh_driver_msg(cb, oid)
+    cour = o["kind"] == "courier"
+    if o["cust_msg_id"]:        # müştərinin kartında ləğv düyməsi artıq yoxdur
+        try:
+            await cb.bot.edit_message_reply_markup(chat_id=o["customer_id"], message_id=o["cust_msg_id"],
+                                                   reply_markup=order_customer_kb(oid, "started"))
+        except Exception:
+            pass
+    try:
+        await cb.bot.send_message(o["customer_id"], "🛵 Çatdırılma başladı." if cour else "▶️ Gediş başladı.")
+    except Exception:
+        logging.warning("customer %s notify failed", o["customer_id"])
+    await cb.answer()
+
+
 @router.callback_query(F.data.startswith("fin:"))
 async def finish(cb: CallbackQuery):
     oid = int(cb.data[4:])
-    n, _ = execute("UPDATE orders SET status='done' WHERE id=? AND status='accepted' AND driver_id=?",
-                   (oid, cb.from_user.id))
+    n, _ = execute("UPDATE orders SET status='done', finished_at=? WHERE id=? AND status='accepted' AND driver_id=?",
+                   (datetime.now(TZ).isoformat(), oid, cb.from_user.id))
     if not n:
         await cb.answer("Sifariş aktiv deyil.", show_alert=True)
         return
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
     try:
-        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.message.edit_text(driver_dm_text(o), reply_markup=None)
     except Exception:
-        pass
-    await cb.message.answer(f"✅ Sifariş #{oid} tamamlandı. Təşəkkür edirik!")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    # sürücü/kuryer dərhal müştərini qiymətləndirir
+    await cb.message.answer(f"✅ Sifariş #{oid} tamamlandı. 💸 {fmt_money(o['price'])}\n\n<b>Müştərini qiymətləndirin:</b>",
+                            reply_markup=stars_kb(oid, "c"))
     if o["cust_msg_id"]:
         try:
             await cb.bot.edit_message_reply_markup(chat_id=o["customer_id"], message_id=o["cust_msg_id"], reply_markup=None)
         except Exception:
             pass
-    await cb.bot.send_message(o["customer_id"], f"✅ Sifariş #{oid} tamamlandı. Təşəkkür edirik!")
+    who = "kuryeri" if o["kind"] == "courier" else "sürücünü"
+    try:
+        await cb.bot.send_message(o["customer_id"], f"✅ Sifariş #{oid} tamamlandı. Təşəkkür edirik! 🙏\n\n<b>{who.capitalize()} qiymətləndirin:</b>",
+                                  reply_markup=stars_kb(oid, "w"))
+    except Exception:
+        logging.warning("customer %s notify failed", o["customer_id"])
     await cb.answer()
+
+
+# ---------- Reytinq ----------
+MIN_RATINGS_SHOWN = int(os.environ.get("MIN_RATINGS_SHOWN", "3"))   # reytinq müştəriyə bu qədər qiymətdən sonra göstərilir
+LOW_STARS = 2                                                      # bu və ya aşağı qiymətdə admin xəbərdar olunur
+awaiting_comment: dict[int, tuple] = {}                            # istifadəçi -> (sifariş, kim qiymətləndirilir, vaxt)
+
+
+def stars_kb(oid: int, target: str) -> InlineKeyboardMarkup:
+    """target: 'c' = müştəri qiymətləndirilir, 'w' = sürücü/kuryer qiymətləndirilir."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rt:{oid}:{target}:{n}") for n in range(1, 6)
+    ]])
+
+
+def rating_of_worker(uid: int, kind: str):
+    r = fetch("SELECT AVG(r.stars) AS a, COUNT(*) AS c FROM ratings r JOIN orders o ON o.id=r.order_id "
+              "WHERE r.target='w' AND o.driver_id=? AND o.kind=?", (uid, kind))
+    return (r["a"] or 0.0, r["c"] or 0) if r else (0.0, 0)
+
+
+def rating_of_customer(uid: int):
+    r = fetch("SELECT AVG(r.stars) AS a, COUNT(*) AS c FROM ratings r JOIN orders o ON o.id=r.order_id "
+              "WHERE r.target='c' AND o.customer_id=?", (uid,))
+    return (r["a"] or 0.0, r["c"] or 0) if r else (0.0, 0)
+
+
+@router.callback_query(F.data.startswith("rt:"))
+async def rate(cb: CallbackQuery):
+    try:
+        _, oid, target, n = cb.data.split(":")
+        oid, n = int(oid), int(n)
+    except ValueError:
+        await cb.answer()
+        return
+    o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
+    uid = cb.from_user.id
+    ok = (o and o["status"] == "done" and 1 <= n <= 5 and
+          ((target == "c" and o["driver_id"] == uid) or (target == "w" and o["customer_id"] == uid)))
+    if not ok:
+        await cb.answer("Qiymətləndirmək mümkün deyil.", show_alert=True)
+        return
+    ratee = o["customer_id"] if target == "c" else o["driver_id"]
+    cnt, _ = execute("INSERT OR IGNORE INTO ratings(order_id,target,rater_id,ratee_id,stars,created) VALUES(?,?,?,?,?,?)",
+                     (oid, target, uid, ratee, n, datetime.now(TZ).isoformat()))
+    if not cnt:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await cb.answer("Artıq qiymətləndirmisiniz.", show_alert=True)
+        return
+    what = "Müştəriyə" if target == "c" else ("Kuryerə" if o["kind"] == "courier" else "Sürücüyə")
+    low = n <= LOW_STARS
+    text = f"Təşəkkürlər! {what} {n}⭐ verdiniz."
+    kb = None
+    if low:
+        text += "\nİstəsəniz səbəbi qısaca yazın (ixtiyari)."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➡️ Keç", callback_data=f"rs:{oid}:{target}")]])
+        awaiting_comment[uid] = (oid, target, time.time())
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    if low:
+        try:
+            who = "Sürücü/kuryer" if target == "c" else "Müştəri"
+            whom = "müştərini" if target == "c" else "sürücünü/kuryeri"
+            await cb.bot.send_message(ADMIN_ID, f"⚠️ Aşağı reytinq: {who} {whom} {n}⭐ qiymətləndirdi.\n"
+                                      f"Sifariş #{oid} ({kind_title(o['kind'])}), rater ID: {uid}, qiymətləndirilən ID: {ratee}")
+        except Exception:
+            pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("rs:"))
+async def rate_skip(cb: CallbackQuery):
+    awaiting_comment.pop(cb.from_user.id, None)
+    try:
+        await cb.message.edit_text("Təşəkkürlər!", reply_markup=None)
+    except Exception:
+        pass
+    await cb.answer()
+
+
+async def save_comment(m: Message) -> bool:
+    """Aşağı qiymətdən sonra yazılan səbəbi yadda saxlayır. Mətn səbəb kimi işlənibsə True qaytarır."""
+    cur = awaiting_comment.pop(m.from_user.id, None)
+    if not cur:
+        return False
+    oid, target, ts = cur
+    if time.time() - ts > 600:          # 10 dəqiqədən sonra adi mətn kimi işlənir
+        return False
+    text = (m.text or "").strip()[:300]
+    execute("UPDATE ratings SET comment=? WHERE order_id=? AND target=? AND rater_id=?", (text, oid, target, m.from_user.id))
+    await m.answer("Təşəkkürlər, qeyd olundu.", reply_markup=with_home())
+    try:
+        await m.bot.send_message(ADMIN_ID, f"📝 Sifariş #{oid} üçün aşağı reytinqin səbəbi:\n{esc(text)}")
+    except Exception:
+        pass
+    return True
 
 
 # ---------- Təsdiqdən sonra imtina (xəbərdarlıqla) ----------
@@ -1561,8 +1994,8 @@ def confirm_kb(yes: str, no: str, oid: int, yes_text: str) -> InlineKeyboardMark
 async def driver_cancel_ask(cb: CallbackQuery):
     oid = int(cb.data[4:])
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    if not o or o["status"] != "accepted" or o["driver_id"] != cb.from_user.id:
-        await cb.answer("Sifariş aktiv deyil.", show_alert=True)
+    if not o or o["status"] != "accepted" or o["driver_id"] != cb.from_user.id or o["stage"] == "started":
+        await cb.answer("Sifariş aktiv deyil və ya gediş artıq başlayıb.", show_alert=True)
         return
     n = recent_cancels(cb.from_user.id, "driver")
     await cb.message.answer(
@@ -1588,12 +2021,13 @@ async def driver_cancel_do(cb: CallbackQuery):
     oid = int(cb.data[4:])
     uid = cb.from_user.id
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    n, _ = execute("UPDATE orders SET status='new', driver_id=NULL WHERE id=? AND status='accepted' AND driver_id=?",
-                   (oid, uid))
+    n, _ = execute("UPDATE orders SET status='new', driver_id=NULL, stage=NULL, arrived_at=NULL WHERE id=? "
+                   "AND status='accepted' AND driver_id=? AND (stage IS NULL OR stage!='started')", (oid, uid))
     if not n:
         await cb.answer("Sifariş aktiv deyil.", show_alert=True)
         return
     d = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=?", (uid, o["kind"]))
+    wlabel = "Kuryer" if o["kind"] == "courier" else "Sürücü"
     execute("INSERT INTO order_cancels(order_id,driver_id,who,created) VALUES(?,?,?,?)", (oid, uid, "driver", time.time()))
     cnt = recent_cancels(uid, "driver")
     await cb.message.edit_text("❌ Sifarişdən imtina etdiniz. Sifariş başqa sürücüyə təklif olunur.")
@@ -1605,7 +2039,7 @@ async def driver_cancel_do(cb: CallbackQuery):
     # müştəriyə xəbər + köhnə kartı bağla
     if o["cust_msg_id"]:
         try:
-            await cb.bot.edit_message_text("Sürücü sifarişdən imtina etdi.", chat_id=o["customer_id"],
+            await cb.bot.edit_message_text(f"{wlabel} sifarişdən imtina etdi.", chat_id=o["customer_id"],
                                            message_id=o["cust_msg_id"], reply_markup=None)
         except Exception:
             pass
@@ -1623,10 +2057,11 @@ async def driver_cancel_do(cb: CallbackQuery):
         "SELECT driver_id FROM order_cancels WHERE order_id=? AND who='driver'", (oid,))}
     sent, group_ok = await offer_order(cb.bot, oid, exclude=excl)
     if sent == 0 and not group_ok:
-        await cb.bot.send_message(o["customer_id"], "😕 Sürücü imtina etdi, yeni sürücü tapa bilmədim. /start ilə yenidən cəhd edin.")
+        await cb.bot.send_message(o["customer_id"], f"😕 {wlabel} imtina etdi, yenisini tapa bilmədim. Yenidən cəhd edin.",
+                                  reply_markup=with_home())
         execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
     else:
-        await cb.bot.send_message(o["customer_id"], "⚠️ Sürücü imtina etdi. Sizə yeni sürücü axtarırıq…",
+        await cb.bot.send_message(o["customer_id"], f"⚠️ {wlabel} imtina etdi. Sizə yenisini axtarırıq…",
                                   reply_markup=cancel_kb(oid))
     if cnt >= CANCEL_WARN:
         await cb.bot.send_message(uid, f"⚠️ Son 24 saatda {cnt} dəfə imtina etmisiniz. Çox imtina etmək olmaz.")
@@ -1641,8 +2076,8 @@ async def driver_cancel_do(cb: CallbackQuery):
 async def customer_cancel_ask(cb: CallbackQuery):
     oid = int(cb.data[4:])
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    if not o or o["status"] != "accepted" or o["customer_id"] != cb.from_user.id:
-        await cb.answer("Sifariş aktiv deyil.", show_alert=True)
+    if not o or o["status"] != "accepted" or o["customer_id"] != cb.from_user.id or o["stage"] == "started":
+        await cb.answer("Sifariş aktiv deyil və ya gediş artıq başlayıb.", show_alert=True)
         return
     await cb.message.answer(
         "⚠️ <b>Diqqət!</b> Sürücü artıq sizə yönəlib. Çox imtina etmək olmaz.\n\nSifarişi ləğv etmək istəyirsiniz?",
@@ -1655,8 +2090,8 @@ async def customer_cancel_ask(cb: CallbackQuery):
 async def customer_cancel_do(cb: CallbackQuery):
     oid = int(cb.data[4:])
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    n, _ = execute("UPDATE orders SET status='cancelled' WHERE id=? AND customer_id=? AND status='accepted'",
-                   (oid, cb.from_user.id))
+    n, _ = execute("UPDATE orders SET status='cancelled' WHERE id=? AND customer_id=? AND status='accepted' "
+                   "AND (stage IS NULL OR stage!='started')", (oid, cb.from_user.id))
     if not n:
         await cb.answer("Sifariş aktiv deyil.", show_alert=True)
         return
@@ -1678,6 +2113,110 @@ async def customer_cancel_do(cb: CallbackQuery):
     except Exception:
         pass
     await cb.answer()
+
+
+# ---------- Profil və statistika ----------
+def short(s, n=26) -> str:
+    s = str(s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def fmt_when(iso) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%d.%m %H:%M")
+    except Exception:
+        return "—"
+
+
+def route_line(o) -> str:
+    return f"{esc(short(o['pickup_label'] or 'xəritə nöqtəsi'))} → {esc(short(o['dest_label']))}"
+
+
+def first_name(s) -> str:
+    parts = str(s or "").split()
+    return parts[0] if parts else "—"
+
+
+def worker_profile_text(uid: int, kind: str) -> str:
+    d = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=?", (uid, kind))
+    rows = fetchall(
+        "SELECT o.*, COALESCE(o.finished_at, o.created) AS t, r.stars AS got FROM orders o "
+        "LEFT JOIN ratings r ON r.order_id=o.id AND r.target='w' "
+        "WHERE o.driver_id=? AND o.kind=? AND o.status='done' ORDER BY o.id DESC", (uid, kind))
+    now = datetime.now(TZ).date()
+    marks = {"Bu gün": now.isoformat(), "Son 7 gün": (now - timedelta(days=6)).isoformat(),
+             "Bu ay": now.replace(day=1).isoformat(), "Cəmi": ""}
+    role = "🛵 Kuryer" if kind == "courier" else "🚕 Sürücü"
+    avg, cnt = rating_of_worker(uid, kind)
+    lines = [f"👤 <b>Profilim</b> · {role}", esc(d["name"] if d else "")]
+    lines.append(f"⭐ {avg:.1f} ({cnt} qiymət)" if cnt else "⭐ Hələ qiymət yoxdur")
+    lines += ["", "<b>Qazanc</b>"]
+    for title, since in marks.items():
+        sel = [r for r in rows if (r["t"] or "") >= since]
+        lines.append(f"{title}: {len(sel)} sifariş · {fmt_money(sum(r['price'] or 0 for r in sel))}")
+    c24 = recent_cancels(uid, "driver")
+    lines.append(f"Son 24 saatda imtina: {c24}")
+    lines += ["", "<b>Son sifarişlər</b>"]
+    if not rows:
+        lines.append("Hələ tamamlanmış sifariş yoxdur.")
+    for i, o in enumerate(rows[:10], 1):
+        star = f" · ⭐{o['got']}" if o["got"] else ""
+        lines.append(f"{i}. {fmt_when(o['t'])} · {fmt_money(o['price'])} · {fmt_dist(o['km'])}{star}\n"
+                     f"    {route_line(o)}\n    👤 {esc(first_name(o['customer_name']))}")
+    return "\n".join(lines)
+
+
+def customer_history_text(uid: int) -> str:
+    rows = fetchall(
+        "SELECT o.*, COALESCE(o.finished_at, o.created) AS t, d.name AS dname, d.plate AS dplate, r.stars AS got "
+        "FROM orders o LEFT JOIN drivers d ON d.user_id=o.driver_id AND d.kind=o.kind "
+        "LEFT JOIN ratings r ON r.order_id=o.id AND r.target='c' "
+        "WHERE o.customer_id=? AND o.status IN ('done','cancelled') ORDER BY o.id DESC", (uid,))
+    done = [r for r in rows if r["status"] == "done"]
+    lines = ["📋 <b>Sifarişlərim</b>", f"Tamamlanan: {len(done)} · Ümumi: {fmt_money(sum(r['price'] or 0 for r in done))}"]
+    avg, cnt = rating_of_customer(uid)
+    if cnt >= MIN_RATINGS_SHOWN:
+        lines.append(f"⭐ Reytinqiniz: {avg:.1f} ({cnt} qiymət)")
+    lines += ["", "<b>Son sifarişlər</b>"]
+    if not rows:
+        lines.append("Hələ sifariş yoxdur.")
+    for i, o in enumerate(rows[:10], 1):
+        icon = "✅" if o["status"] == "done" else "🚫"
+        kind = "🛵" if o["kind"] == "courier" else "🚕"
+        who = f"\n    {kind} {esc(o['dname'])}" + (f" ({esc(o['dplate'])})" if o["dplate"] and norm(o["dplate"]) not in ("yoxdur", "-") else "") if o["dname"] else ""
+        lines.append(f"{i}. {icon} {fmt_when(o['t'])} · {fmt_money(o['price'])}\n    {route_line(o)}{who}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("prof:"))
+async def cb_profile(cb: CallbackQuery):
+    kind = "courier" if cb.data == "prof:courier" else "taxi"
+    if kind not in approved_kinds(cb.from_user.id):
+        await cb.answer("Bu rol üçün təsdiqlənməmisiniz.", show_alert=True)
+        return
+    await cb.message.answer(worker_profile_text(cb.from_user.id, kind), reply_markup=with_home())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "my")
+async def cb_my_orders(cb: CallbackQuery):
+    await cb.message.answer(customer_history_text(cb.from_user.id), reply_markup=with_home())
+    await cb.answer()
+
+
+@router.message(Command("profil"), F.chat.type == ChatType.PRIVATE)
+async def cmd_profile(m: Message):
+    kinds = sorted(approved_kinds(m.from_user.id))
+    if not kinds:
+        await m.answer("Profil yalnız təsdiqlənmiş sürücü və kuryerlər üçündür. Sifarişləriniz üçün /sifarisler")
+        return
+    for k in kinds:
+        await m.answer(worker_profile_text(m.from_user.id, k), reply_markup=with_home())
+
+
+@router.message(Command("sifarisler"), F.chat.type == ChatType.PRIVATE)
+async def cmd_my_orders(m: Message):
+    await m.answer(customer_history_text(m.from_user.id), reply_markup=with_home())
 
 
 # ---------- Qeydiyyat ----------
@@ -1760,7 +2299,7 @@ async def _reg_start(target: Message, state: FSMContext, kind: str):
     await state.set_state(Reg.name)
     await state.update_data(kind=kind)
     await target.answer(f"{'Kuryer' if kind == 'courier' else 'Sürücü'} qeydiyyatı. Ad və soyadınızı yazın:",
-                        reply_markup=home_kb())
+                        reply_markup=with_home())
 
 
 @router.message(Command("driver"), F.chat.type == ChatType.PRIVATE)
@@ -1783,7 +2322,7 @@ async def cb_reg(cb: CallbackQuery, state: FSMContext):
 async def reg_name(m: Message, state: FSMContext):
     await state.update_data(name=m.text.strip())
     await state.set_state(Reg.phone)
-    await m.answer("Mobil nömrənizi yazın (məs. +994501234567):")
+    await m.answer("Mobil nömrənizi yazın (məs. +994501234567):", reply_markup=with_home())
 
 
 @router.message(Reg.phone, F.text)
@@ -1792,7 +2331,7 @@ async def reg_phone(m: Message, state: FSMContext):
     await state.set_state(Reg.car)
     kind = (await state.get_data()).get("kind", "taxi")
     await m.answer("Nəqliyyat növü (velosiped, moto, avtomobil):" if kind == "courier"
-                   else "Maşın modeli və rəngi (məs. Hyundai Elantra, ağ):")
+                   else "Maşın modeli və rəngi (məs. Hyundai Elantra, ağ):", reply_markup=with_home())
 
 
 @router.message(Reg.car, F.text)
@@ -1801,7 +2340,7 @@ async def reg_car(m: Message, state: FSMContext):
     await state.set_state(Reg.plate)
     kind = (await state.get_data()).get("kind", "taxi")
     await m.answer("Dövlət nömrəsi (yoxdursa «yoxdur» yazın):" if kind == "courier"
-                   else "Dövlət nömrəsi (məs. 10-AA-123):")
+                   else "Dövlət nömrəsi (məs. 10-AA-123):", reply_markup=with_home())
 
 
 @router.message(Reg.plate, F.text)
@@ -1818,9 +2357,11 @@ async def reg_plate(m: Message, state: FSMContext):
         (uid, data["name"], data["phone"], data["car"], m.text.strip(), approved, kind),
     )
     if approved:
-        await m.answer("✅ Qeydiyyat tamamlandı, siz təsdiqlənmisiniz. İşə başlamaq üçün /onlayn yazın.")
+        await m.answer("✅ Qeydiyyat tamamlandı, siz təsdiqlənmisiniz. İşə başlamaq üçün /onlayn yazın.",
+                       reply_markup=with_home())
         return
-    await m.answer("Qeydiyyat göndərildi. Admin təsdiqləyəndən sonra /onlayn yazıb işə başlaya biləcəksiniz.")
+    await m.answer("Qeydiyyat göndərildi. Admin təsdiqləyəndən sonra /onlayn yazıb işə başlaya biləcəksiniz.",
+                   reply_markup=with_home())
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Təsdiq et", callback_data=f"appr:{uid}:{kind}"),
         InlineKeyboardButton(text="🚫 Rədd et", callback_data=f"deny:{uid}:{kind}"),
