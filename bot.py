@@ -565,21 +565,31 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
+def _clean_label(label: str) -> str:
+    label = re.split(r",\s*(?:Baku|Bakı)\b", label or "")[0]
+    label = re.sub(r",\s*Azerbaijan\s*$", "", label).strip(" ,")
+    return label[:70]
+
+
 async def reverse_label(lat, lon):
-    """Koordinatın qısa ünvanı (profil tarixçəsi üçün). Alınmasa None."""
-    params = {"api_key": ORS_KEY, "point.lat": str(lat), "point.lon": str(lon), "size": "1", "boundary.country": "AZ"}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(GEOCODE_URL.replace("/search", "/reverse"), params=params,
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                data = await r.json()
-        props = (data.get("features") or [{}])[0].get("properties", {}) or {}
-        label = props.get("label") or props.get("name") or ""
-        label = re.split(r",\s*(?:Baku|Bakı)\b", label)[0].strip(" ,")
-        return label[:60] or None
-    except Exception:
-        logging.warning("reverse geocode alınmadı")
-        return None
+    """Koordinatın real ünvanı (küçə/bina/obyekt adı). Əvvəl 150 m, alınmasa 600 m radiusda axtarılır; tapılmasa None."""
+    for radius in ("0.15", "0.6"):
+        params = {"api_key": ORS_KEY, "point.lat": str(lat), "point.lon": str(lon), "size": "3",
+                  "boundary.country": "AZ", "boundary.circle.radius": radius}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(GEOCODE_URL.replace("/search", "/reverse"), params=params,
+                                 timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    data = await r.json()
+        except Exception:
+            logging.warning("reverse geocode alınmadı")
+            return None
+        for f in data.get("features") or []:
+            props = f.get("properties", {}) or {}
+            label = _clean_label(props.get("label") or props.get("name") or "")
+            if label and norm(label) not in ("baku", "baki", "azerbaijan", "azerbaycan"):
+                return label
+    return None
 
 
 async def fill_pickup_label(oid: int, lat, lon):
@@ -609,9 +619,14 @@ def order_text(o, road_km=None) -> str:
     """Sürücüyə gedən mesaj. İki link heç vaxt alt-alta düşmür, son sətir müştərinin yolunun məsafəsidir.
     Fərdi mesajda götürülmə yerinin yanında mötərizədə sürücüdən yol məsafəsi yazılır."""
     near = f" ({fmt_dist(road_km)})" if road_km is not None else ""
+    try:
+        pl = o["pickup_label"]
+    except (KeyError, IndexError):
+        pl = None
+    where = f": {esc(pl)}" if pl else ""
     lines = [
         f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['id']}</b>",
-        f"<a href=\"{waze(o['plat'], o['plon'])}\">📍 Götürülmə yeri</a>{near} 👈",
+        f"<a href=\"{waze(o['plat'], o['plon'])}\">📍 Götürülmə yeri</a>{where}{near} 👈",
         f"💸 Ödəniş məbləği: {fmt_money(o['price'])}",
     ]
     if o["note"]:
@@ -650,18 +665,19 @@ BACK_TEXT = "🏠 Əvvələ qayıt"
 ROLES_TEXT = "Salam 👋 Kimsiniz?"
 
 
-def home_row():
-    return [InlineKeyboardButton(text=BACK_TEXT, callback_data="home")]
+def home_kb():
+    """Aşağıda daimi duran «Əvvələ qayıt» düyməsi."""
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BACK_TEXT)]], resize_keyboard=True, is_persistent=True)
 
 
-def with_home(rows=None) -> InlineKeyboardMarkup:
-    """Mesajın düymələrinin ən sonuna «Əvvələ qayıt» əlavə edir."""
-    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in (rows or [])] + [home_row()])
+def with_home(rows=None):
+    """Mesajın inline düymələri (varsa). «Əvvələ qayıt» artıq aşağıdakı daimi düymədir."""
+    rows = [list(r) for r in (rows or [])]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-def kb_home(kb=None) -> InlineKeyboardMarkup:
-    """Hazır inline klaviaturanın (və ya heç nəyin) sonuna «Əvvələ qayıt» qoyur."""
-    return with_home(kb.inline_keyboard if kb is not None else None)
+def kb_home(kb=None):
+    return kb
 
 
 def start_kb():
@@ -670,15 +686,6 @@ def start_kb():
         keyboard=[[KeyboardButton(text="📍 Yerimi göndər", request_location=True)], [KeyboardButton(text=BACK_TEXT)]],
         resize_keyboard=True, is_persistent=True,
     )
-
-
-async def drop_reply_kb(target: Message):
-    """Köhnə daimi klaviaturanı (aşağıdakı düymə sırası) bir dəfə silir."""
-    try:
-        tmp = await target.answer("…", reply_markup=ReplyKeyboardRemove())
-        await tmp.delete()
-    except Exception:
-        pass
 
 
 def customer_phone(uid: int):
@@ -1215,6 +1222,10 @@ async def api_pickup(request):
     async def send(text, reply_markup=None):
         await bot.send_message(uid, text, reply_markup=reply_markup)
 
+    try:
+        await bot.send_location(uid, lat, lon)       # xəritə yenə mesaj kimi görünsün
+    except Exception:
+        logging.warning("location message failed")
     await set_pickup(send, uid, p["kind"], lat, lon)
     return web.json_response({"ok": True})
 
@@ -1245,16 +1256,15 @@ LIVE_HELP = (
 async def start(m: Message, state: FSMContext):
     await state.clear()
     pending.pop(m.from_user.id, None)
-    await drop_reply_kb(m)          # köhnə versiyadan qalan aşağıdakı düymə sırasını silir
+    await m.answer("Aşağıdakı «Əvvələ qayıt» düyməsi istənilən vaxt əsas menyuya qaytarır.", reply_markup=home_kb())
     await m.answer(ROLES_TEXT, reply_markup=role_kb())
 
 
 @router.message(F.text == BACK_TEXT, F.chat.type == ChatType.PRIVATE)
 async def go_home(m: Message, state: FSMContext):
-    """Köhnə daimi düymə hələ qalıbsa: menyuya qaytarır və həmin düyməni silir."""
     await state.clear()
     pending.pop(m.from_user.id, None)
-    await drop_reply_kb(m)
+    awaiting_comment.pop(m.from_user.id, None)
     await m.answer(ROLES_TEXT, reply_markup=role_kb())
 
 
@@ -1401,15 +1411,32 @@ async def choose_service(cb: CallbackQuery):
 
 
 # ---------- Müştəri: yer, ünvan, qiymət ----------
+async def _set_plabel(p: dict, lat, lon):
+    label = await reverse_label(lat, lon)
+    p["plabel"] = label or ""
+
+
+async def send_map(bot, chat_id, lat, lon, title=None, address=None):
+    """Xəritə mesajı göndərir. title verilibsə, xəritənin altında yazı ilə (məs. «Götürülmə yeri») görünür."""
+    try:
+        if title:
+            await bot.send_venue(chat_id, lat, lon, title=str(title)[:100] or "Yer", address=str(address or "—")[:200])
+        else:
+            await bot.send_location(chat_id, lat, lon)
+    except Exception:
+        logging.warning("map message to %s failed", chat_id)
+
+
 async def set_pickup(send, uid: int, kind: str, lat: float, lon: float):
     """Götürülmə nöqtəsini yadda saxlayır və təyinatı soruşur. send(text, reply_markup=...) mesaj göndərən funksiyadır."""
-    pending[uid] = {"kind": kind, "plat": lat, "plon": lon}
+    p = pending[uid] = {"kind": kind, "plat": lat, "plon": lon}
+    spawn(_set_plabel(p, lat, lon))           # götürülmə ünvanı arxa planda tapılır (sifarişdə və tarixçədə görünür)
     if kind == "courier":
         ask = "Bağlama hara göndəriləcək? Ünvanı yazın və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin."
     else:
         ask = ("Haraya gedəcəksiniz? Ünvanı yazın (məs. <i>28 Mall</i>) "
                "və ya 📎 → Yer vasitəsilə xəritədən nöqtə göndərin.")
-    await send(ask, reply_markup=with_home())
+    await send(ask, reply_markup=home_kb())
 
 
 @router.message(F.location, F.chat.type == ChatType.PRIVATE, StateFilter(None))
@@ -1439,11 +1466,10 @@ async def on_location(m: Message):
         await m.answer("Nə lazımdır?", reply_markup=kb_home(customer_menu_kb()))
         return
     if "plat" not in p:
-        if not WEBAPP_URL:
-            await drop_reply_kb(m)       # köhnə üsulda aşağıdakı «Yerimi göndər» düyməsi silinir
         await set_pickup(m.answer, uid, kind, loc.latitude, loc.longitude)
     else:
-        await quote(m, p, loc.latitude, loc.longitude, "Xəritədən seçilmiş nöqtə")
+        label = await reverse_label(loc.latitude, loc.longitude) or "Xəritədən seçilmiş nöqtə"
+        await quote(m, p, loc.latitude, loc.longitude, label, show_map=False)
 
 
 @router.edited_message(F.location, F.chat.type == ChatType.PRIVATE)
@@ -1541,7 +1567,11 @@ def parse_weight(text: str):
     return round(w, 1) if 0 < w <= 200 else None
 
 
-async def quote(m: Message, p: dict, dlat, dlon, label):
+async def quote(m: Message, p: dict, dlat, dlon, label, show_map=True):
+    """show_map=False: müştəri təyinatı özü xəritə nöqtəsi kimi göndərib (onun öz mesajı artıq xəritədir)."""
+    if show_map and p.get("map_for") != (dlat, dlon):         # eyni təyinat üçün xəritə təkrar göndərilmir
+        p["map_for"] = (dlat, dlon)
+        await send_map(m.bot, m.chat.id, dlat, dlon, title=label, address="🏁 Gediləcək yer")
     if p.get("kind") == "courier" and "weight" not in p:   # kuryerdə qiymətdən əvvəl çəki soruşulur
         p.update(dlat=dlat, dlon=dlon, label=label, await_weight=True)
         await m.answer(WEIGHT_ASK, reply_markup=with_home())
@@ -1674,13 +1704,21 @@ def cancel_kb(oid: int) -> InlineKeyboardMarkup:
 
 
 async def dispatch_order(bot, uid: int, uname: str, p: dict):
+    plabel = p.get("plabel")
+    if plabel is None:                                         # hələ tapılmayıbsa qısa gözlə
+        try:
+            plabel = await asyncio.wait_for(reverse_label(p["plat"], p["plon"]), 5)
+        except Exception:
+            plabel = None
     _, oid = execute(
-        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,recv_phone,created) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,recv_phone,"
+        "created,pickup_label) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (uid, uname, p.get("kind", "taxi"), p["plat"], p["plon"], p["dlat"], p["dlon"], p["label"],
-         p["km"], p["price"], p.get("note", ""), p.get("weight"), p.get("recv_phone"), datetime.now(TZ).isoformat()),
+         p["km"], p["price"], p.get("note", ""), p.get("weight"), p.get("recv_phone"), datetime.now(TZ).isoformat(),
+         plabel or None),
     )
-    spawn(fill_pickup_label(oid, p["plat"], p["plon"]))       # tarixçə üçün götürülmə ünvanı (arxa planda)
+    if not plabel:
+        spawn(fill_pickup_label(oid, p["plat"], p["plon"]))   # alınmayıbsa sonradan tarixçə üçün doldurulur
     sent, group_ok = await offer_order(bot, oid)
     if sent == 0 and not group_ok:
         execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
@@ -1766,6 +1804,10 @@ async def accept(cb: CallbackQuery):
 
     cmsg = await cb.bot.send_message(o["customer_id"], driver_card(d, o), reply_markup=order_customer_kb(oid))
     execute("UPDATE orders SET cust_msg_id=? WHERE id=?", (cmsg.message_id, oid))
+    # qəbul edənə iki xəritə mesajı: götürülmə yeri və gediləcək yer (düymələr olan mesaj ən sonda qalır)
+    await send_map(cb.bot, d["user_id"], o["plat"], o["plon"], title="📍 Götürülmə yeri",
+                   address=o["pickup_label"] or "Müştərinin yeri")
+    await send_map(cb.bot, d["user_id"], o["dlat"], o["dlon"], title="🏁 Gediləcək yer", address=o["dest_label"])
     try:
         dmsg = await cb.bot.send_message(d["user_id"], driver_dm_text(o), reply_markup=order_driver_kb(o))
         execute("UPDATE orders SET drv_msg_id=? WHERE id=?", (dmsg.message_id, oid))
@@ -2299,7 +2341,7 @@ async def _reg_start(target: Message, state: FSMContext, kind: str):
     await state.set_state(Reg.name)
     await state.update_data(kind=kind)
     await target.answer(f"{'Kuryer' if kind == 'courier' else 'Sürücü'} qeydiyyatı. Ad və soyadınızı yazın:",
-                        reply_markup=with_home())
+                        reply_markup=home_kb())
 
 
 @router.message(Command("driver"), F.chat.type == ChatType.PRIVATE)
