@@ -2638,7 +2638,7 @@ async def send_backup(bot, why: str):
     await bot.send_document(
         ADMIN_ID,
         BufferedInputFile(data, filename=f"taxi_{stamp}.db"),
-        caption=f"💾 Baza yedəyi ({why})\n{_counts()}\nBərpa üçün: bu faylı mənə göndərin və başlığa /berpa yazın.",
+        caption=f"💾 Baza yedəyi ({why})\n{_counts()}\nBərpa üçün: faylı söhbətə göndərin, sonra ona cavab (reply) verib /berpa yazın.",
     )
 
 
@@ -2693,16 +2693,32 @@ def _restore_from(path: str) -> str:
 
 
 @router.message(F.document, F.chat.type == ChatType.PRIVATE, F.caption.startswith("/berpa"))
-async def cmd_restore(m: Message):
+async def cmd_restore_caption(m: Message):
+    await _do_restore(m, m.document)
+
+
+@router.message(Command("berpa"), F.reply_to_message.document, F.chat.type == ChatType.PRIVATE)
+async def cmd_restore_reply(m: Message):
+    await _do_restore(m, m.reply_to_message.document)
+
+
+@router.message(Command("berpa"), F.chat.type == ChatType.PRIVATE)
+async def cmd_restore_help(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
-    if m.document.file_size and m.document.file_size > 20 * 1024 * 1024:
+    await m.answer("Baza faylını (taxi.db) söhbətə göndərin, sonra həmin fayla cavab (reply) verib /berpa yazın.")
+
+
+async def _do_restore(m: Message, doc):
+    if m.from_user.id != ADMIN_ID:
+        return
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await m.answer("Fayl çox böyükdür (20 MB-dan çox).")
         return
     fd, tmp = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
-        await m.bot.download(m.document, destination=tmp)
+        await m.bot.download(doc, destination=tmp)
         err = await asyncio.to_thread(_restore_from, tmp)
     finally:
         try:
