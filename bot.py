@@ -502,7 +502,8 @@ def _collect(found: dict, features, toks, text, near=None):
         if key in found:
             continue
         nl = norm(label)
-        found[key] = {"lat": lat, "lon": lon, "label": label, "score": score,
+        found[key] = {"lat": lat, "lon": lon, "label": make_label(props, label), "score": score,
+                      "pname": props.get("name") if props.get("layer") == "venue" else None,
                       "baku": ("baku" in nl or "baki" in nl), "order": len(found),
                       "dist": dist_km(near[0], near[1], lat, lon) if near else 0.0}
 
@@ -518,6 +519,18 @@ def search_places(toks, near=None):
                     "order": r["id"], "dist": dist_km(near[0], near[1], r["lat"], r["lon"]) if near else 0.0})
     out.sort(key=lambda c: (c["dist"], c["order"]))
     return out
+
+
+def _disambiguate(cands):
+    """Eyni adlı nəticələr (məs. bir neçə filial) düymədə müştərinin yerindən məsafə ilə fərqləndirilir."""
+    cnt = {}
+    for c in cands:
+        cnt[norm(c["label"])] = cnt.get(norm(c["label"]), 0) + 1
+    for c in cands:
+        c["btn"] = c["label"]
+        if cnt[norm(c["label"])] > 1 and c.get("dist"):
+            c["btn"] = f"{c['label']} · {fmt_dist(c['dist'])}"
+    return cands
 
 
 async def geocode(text: str, near=None):
@@ -557,7 +570,9 @@ async def geocode(text: str, near=None):
             c["score"] = max(c["score"], 1.0)
     else:
         cands = sorted(found.values(), key=lambda c: (-c["score"], not c["baku"], c["order"]))
-    return cands[:5]
+    cands = cands[:5]
+    await _enrich_labels(cands)
+    return _disambiguate(cands)
 
 
 # ---------- Mesaj köməkçiləri ----------
@@ -565,20 +580,151 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
-def _clean_label(label: str) -> str:
-    label = re.split(r",\s*(?:Baku|Bakı)\b", label or "")[0]
-    label = re.sub(r",\s*Azerbaijan\s*$", "", label).strip(" ,")
-    return label[:70]
+NOMINATIM_URL = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/reverse")
+_TYPE_SUFFIX = re.compile(r"\s+(rayonu|rayon|raion|district|region|şəhəri|kəndi|qəsəbəsi|city|municipality)$", re.I)
+_POI_CATS = {"amenity", "shop", "tourism", "leisure", "office", "craft", "healthcare", "historic", "man_made", "emergency"}
 
 
-async def reverse_label(lat, lon):
-    """Koordinatın real ünvanı (küçə/bina/obyekt adı). Əvvəl 150 m, alınmasa 600 m radiusda axtarılır; tapılmasa None."""
-    for radius in ("0.15", "0.6"):
-        params = {"api_key": ORS_KEY, "point.lat": str(lat), "point.lon": str(lon), "size": "3",
-                  "boundary.country": "AZ", "boundary.circle.radius": radius}
+def _nice(s) -> str:
+    """Ad təmizlənir: «Baku»→«Bakı», sonundakı «rayonu/kəndi/District» kimi növ sözləri atılır."""
+    s = str(s or "").strip()
+    s = _TYPE_SUFFIX.sub("", s).strip(" ,")
+    return "Bakı" if norm(s) in ("baku", "baki") else s
+
+
+def _join_parts(parts, limit=90) -> str:
+    """Təkrarsız birləşdirir (eyni ad iki dəfə yazılmır), ümumi uzunluq məhdudlaşdırılır."""
+    out, seen = [], set()
+    for p in parts:
+        p = _nice(p)
+        k = norm(p)
+        if not p or k in seen or k in ("azerbaijan", "azerbaycan", "ba"):
+            continue
+        if any(k in x or x in k for x in seen if len(x) > 3 and len(k) > 3):   # «Nəsimi» və «Nəsimi rayonu» kimi təkrarlar
+            continue
+        seen.add(k)
+        out.append(p)
+    return ", ".join(out)[:limit].rstrip(" ,")
+
+
+def make_label(props: dict, fallback: str = "") -> str:
+    """Pelias nəticəsindən ünvan: obyekt/küçə adı + məhəllə/rayon + şəhər/kənd (+ rayon). «BA, Azerbaijan» yazılmır."""
+    props = props or {}
+    name, street, hn = props.get("name"), props.get("street"), props.get("housenumber")
+    if props.get("layer") == "address" and street:
+        head = f"{street} {hn}".strip() if hn else street
+    else:
+        head = name or ""
+    near_part = next((props.get(k) for k in ("neighbourhood", "borough") if props.get(k)), None)
+    town = next((props.get(k) for k in ("locality", "localadmin") if props.get(k)), None)
+    county = props.get("county")
+    parts = [head]
+    if street and head != street and not (hn and head.startswith(street)) and not near_part:
+        parts.append(street)               # filial aydın olsun deyə küçə (məhəllə yoxdursa)
+    parts += [near_part, town]
+    if not town or norm(_nice(town)) != "baki":
+        parts.append(county)               # kənd/qəsəbədə rayon da yazılır: «Söyüdlü, Gədəbəy»
+    out = _join_parts(parts)
+    if out:
+        return out
+    raw = re.sub(r",\s*(?:BA|Azerbaijan)\b", "", fallback or "")
+    return _join_parts([x for x in raw.split(",")]) or (fallback or "")
+
+
+def label_from_nominatim(data: dict, poi=None) -> str:
+    """OpenStreetMap-ın (Nominatim) cavabından qısa ünvan: obyekt/küçə, məhəllə, kənd/şəhər, rayon.
+    poi verilibsə (məs. «Domino's Pizza»), ünvanın başı həmin addır."""
+    addr = (data or {}).get("address") or {}
+    head = ""
+    if poi:
+        head = poi
+    elif (data or {}).get("category") in _POI_CATS and data.get("name"):
+        head = data["name"]
+    elif addr.get("road"):
+        head = f"{addr['road']} {addr['house_number']}".strip() if addr.get("house_number") else addr["road"]
+    near_part = next((addr.get(k) for k in ("suburb", "neighbourhood", "quarter", "city_district") if addr.get(k)), None)
+    skey = next((k for k in ("village", "hamlet", "town", "city", "municipality") if addr.get(k)), None)
+    parts = [head, near_part, addr.get(skey) if skey else None]
+    if skey != "city":
+        parts.append(addr.get("county") or addr.get("state_district"))
+    return _join_parts(parts)
+
+
+NOM_GAP = 1.05                      # Nominatim qaydası: saniyədə ən çoxu 1 sorğu
+_nom = {"last": 0.0, "block": 0.0, "lock": None, "cache": {}}
+
+
+async def _nominatim_raw(lat, lon):
+    """Nominatim cavabı (dict) və ya None. Sorğular ardıcıl və ≥1 san aralıqla gedir, nəticə yadda qalır;
+    xəta/limit olarsa 1 dəqiqə ərzində yenidən cəhd edilmir (gözləmə yaranmasın)."""
+    key = (round(float(lat), 5), round(float(lon), 5))
+    if key in _nom["cache"]:
+        return _nom["cache"][key]
+    if time.time() < _nom["block"]:
+        return None
+    if _nom["lock"] is None:
+        _nom["lock"] = asyncio.Lock()
+    params = {"format": "jsonv2", "lat": str(lat), "lon": str(lon), "zoom": "18", "addressdetails": "1",
+              "accept-language": "az,en"}
+    ua = {"User-Agent": f"YoltTaxiBot/1.0 ({WEBAPP_URL or 'telegram bot'})"}
+    async with _nom["lock"]:
+        wait = NOM_GAP - (time.monotonic() - _nom["last"])
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _nom["last"] = time.monotonic()
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(GEOCODE_URL.replace("/search", "/reverse"), params=params,
+                async with s.get(NOMINATIM_URL, params=params, headers=ua, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    status = getattr(r, "status", 200)
+                    if status != 200:
+                        raise RuntimeError(f"HTTP {status}")
+                    data = await r.json()
+        except Exception as e:
+            logging.warning("nominatim reverse alınmadı: %s", e)
+            _nom["block"] = time.time() + 60
+            return None
+    if len(_nom["cache"]) > 500:
+        _nom["cache"].clear()
+    _nom["cache"][key] = data
+    return data
+
+
+async def _nominatim_label(lat, lon):
+    data = await _nominatim_raw(lat, lon)
+    return (label_from_nominatim(data) if data else "") or None
+
+
+async def _enrich_labels(cands):
+    """Eyni adlı (filiallar) və ya yeri bilinməyən («Kapital Bank») nəticələrə məhəllə/rayon əlavə edir:
+    «Domino's Pizza, Bakı» -> «Domino's Pizza, Gənclik, Bakı». Müddət məhduddur; alınmasa ad olduğu kimi qalır."""
+    cnt = {}
+    for c in cands:
+        cnt[norm(c["label"])] = cnt.get(norm(c["label"]), 0) + 1
+    todo = [c for c in cands if c.get("pname") and (cnt[norm(c["label"])] > 1 or "," not in c["label"])]
+    if not todo:
+        return
+
+    async def work():
+        for c in todo:
+            data = await _nominatim_raw(c["lat"], c["lon"])
+            lab = label_from_nominatim(data, poi=c["pname"]) if data else ""
+            if lab and "," in lab:
+                c["label"] = lab
+    try:
+        await asyncio.wait_for(work(), 8)
+    except Exception:
+        logging.warning("ünvan dəqiqləşdirilməsi yarımçıq qaldı")
+
+
+async def _pelias_reverse_label(lat, lon):
+    """Ehtiyat yol: Pelias. Əvvəl 150 m, sonra 600 m, sonda kənd/rayon (coğrafi sahə) səviyyəsi."""
+    base = {"api_key": ORS_KEY, "point.lat": str(lat), "point.lon": str(lon), "size": "3", "boundary.country": "AZ"}
+    tries = [{"boundary.circle.radius": "0.15"}, {"boundary.circle.radius": "0.6"},
+             {"layers": "neighbourhood,locality,localadmin,county"}]
+    for extra in tries:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(GEOCODE_URL.replace("/search", "/reverse"), params={**base, **extra},
                                  timeout=aiohttp.ClientTimeout(total=6)) as r:
                     data = await r.json()
         except Exception:
@@ -586,10 +732,17 @@ async def reverse_label(lat, lon):
             return None
         for f in data.get("features") or []:
             props = f.get("properties", {}) or {}
-            label = _clean_label(props.get("label") or props.get("name") or "")
+            if props.get("layer") in ("region", "macroregion", "macrocounty", "country"):
+                continue                      # «Ganja - Gazakh» kimi iri bölgə adları ünvan sayılmır
+            label = make_label(props, props.get("label") or "")
             if label and norm(label) not in ("baku", "baki", "azerbaijan", "azerbaycan"):
                 return label
     return None
+
+
+async def reverse_label(lat, lon):
+    """Koordinatın real ünvanı. Əvvəl OpenStreetMap-ın öz xidməti (kənd və rayon adlarını da verir), alınmasa Pelias."""
+    return await _nominatim_label(lat, lon) or await _pelias_reverse_label(lat, lon)
 
 
 async def fill_pickup_label(oid: int, lat, lon):
@@ -1468,7 +1621,7 @@ async def on_location(m: Message):
     if "plat" not in p:
         await set_pickup(m.answer, uid, kind, loc.latitude, loc.longitude)
     else:
-        label = await reverse_label(loc.latitude, loc.longitude) or "Xəritədən seçilmiş nöqtə"
+        label = await reverse_label(loc.latitude, loc.longitude) or f"{loc.latitude:.5f}, {loc.longitude:.5f}"
         await quote(m, p, loc.latitude, loc.longitude, label, show_map=False)
 
 
@@ -1551,7 +1704,7 @@ async def on_text(m: Message):
         return
     p["cands"] = cands
     kb = with_home([
-        [InlineKeyboardButton(text=f"{i + 1}. {c['label'][:55]}", callback_data=f"g:{i}")]
+        [InlineKeyboardButton(text=f"{i + 1}. {c.get('btn', c['label'])[:62]}", callback_data=f"g:{i}")]
         for i, c in enumerate(cands)
     ])
     note = ("Bir neçə uyğun ünvan tapdım." if best["score"] >= 1
