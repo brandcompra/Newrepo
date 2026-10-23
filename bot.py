@@ -25,6 +25,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
@@ -2594,6 +2595,126 @@ async def admin_decision(cb: CallbackQuery):
     await cb.answer()
 
 
+# ---------- Yedək (backup) ----------
+import tempfile
+
+BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "4"))          # Bakı vaxtı ilə gündəlik yedək saatı
+
+
+def make_backup_bytes() -> bytes:
+    """Bazanın tutarlı surətini (yazı zamanı belə) bayt kimi qaytarır."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _counts() -> str:
+    out = []
+    for t, name in (("drivers", "sürücü/kuryer"), ("customers", "müştəri"), ("orders", "sifariş")):
+        try:
+            out.append(f"{name}: {fetch(f'SELECT COUNT(*) FROM {t}')[0]}")
+        except Exception:
+            pass
+    return ", ".join(out)
+
+
+async def send_backup(bot, why: str):
+    data = await asyncio.to_thread(make_backup_bytes)
+    stamp = datetime.now(ZoneInfo("Asia/Baku")).strftime("%Y-%m-%d_%H-%M")
+    await bot.send_document(
+        ADMIN_ID,
+        BufferedInputFile(data, filename=f"taxi_{stamp}.db"),
+        caption=f"💾 Baza yedəyi ({why})\n{_counts()}\nBərpa üçün: bu faylı mənə göndərin və başlığa /berpa yazın.",
+    )
+
+
+async def backup_loop(bot):
+    while True:
+        now = datetime.now(ZoneInfo("Asia/Baku"))
+        nxt = now.replace(hour=BACKUP_HOUR, minute=0, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
+        try:
+            await send_backup(bot, "gündəlik")
+        except Exception:
+            logging.exception("gündəlik yedək göndərilmədi")
+
+
+@router.message(Command("yedek"), F.chat.type == ChatType.PRIVATE)
+async def cmd_backup(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    await send_backup(m.bot, "sorğu ilə")
+
+
+def _restore_from(path: str) -> str:
+    """Faylı yoxlayıb canlı bazanın üstünə yazır. Uğursuzluqda mətnlə səbəb qaytarır, uğurda ''."""
+    try:
+        chk = sqlite3.connect(path)
+        try:
+            if chk.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return "Fayl zədəlidir."
+            tabs = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            chk.close()
+    except Exception:
+        return "Bu SQLite bazası deyil."
+    if not {"drivers", "orders"} <= tabs:
+        return "Bu bizim botun bazası deyil (drivers/orders cədvəlləri yoxdur)."
+    try:                                                         # əvvəlki halı ehtiyat üçün saxla
+        with open(DB_PATH + ".before_restore", "wb") as f:
+            f.write(make_backup_bytes())
+    except Exception:
+        pass
+    src = sqlite3.connect(path)
+    dst = sqlite3.connect(DB_PATH)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    init_db()                                                    # köhnə yedəkdə çatışmayan cədvəl/sütunlar əlavə olunsun
+    return ""
+
+
+@router.message(F.document, F.chat.type == ChatType.PRIVATE, F.caption.startswith("/berpa"))
+async def cmd_restore(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    if m.document.file_size and m.document.file_size > 20 * 1024 * 1024:
+        await m.answer("Fayl çox böyükdür (20 MB-dan çox).")
+        return
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        await m.bot.download(m.document, destination=tmp)
+        err = await asyncio.to_thread(_restore_from, tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if err:
+        await m.answer("❌ Bərpa olunmadı. " + err)
+    else:
+        await m.answer("✅ Baza bərpa olundu.\n" + _counts())
+
+
 # ---------- Başlat ----------
 async def main():
     init_db()
@@ -2603,6 +2724,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
+    spawn(backup_loop(bot))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
