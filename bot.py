@@ -534,6 +534,128 @@ def _disambiguate(cands):
     return cands
 
 
+# ---------- GoMap.az (yerli xəritə bazası) ----------
+GOMAP_KEY = os.environ.get("GOMAP_KEY", "").strip()
+GOMAP_URL = os.environ.get("GOMAP_URL", "http://api.gomap.az/Main.asmx").rstrip("/")
+_gm = {"fail": 0, "until": 0.0, "cache": {}, "logged": 0}
+GM_CLUSTER_KM = 0.12                     # bir-birinə 120 m-dən yaxın nəticələr (məs. mall içindəki mağazalar) bir sayılır
+
+
+def _gomap_parse(text: str):
+    """Cavab JSON-dur; ASMX bəzən XML <string>...</string> içində verir: hər ikisini oxuyur."""
+    text = (text or "").strip()
+    if text.startswith("<"):
+        text = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j < i:
+        return None
+    try:
+        return json.loads(text[i:j + 1])
+    except Exception:
+        return None
+
+
+async def _gomap_call(method: str, params: dict, timeout: int = 8):
+    """GoMap sorğusu. Ardıcıl xətalarda 2 dəqiqə susur (bot yavaşlamasın, ehtiyat axtarışa keçsin)."""
+    if not GOMAP_KEY or time.monotonic() < _gm["until"]:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{GOMAP_URL}/{method}", params={**params, "guid": GOMAP_KEY},
+                             timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                body = await r.text()
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+        data = _gomap_parse(body)
+        if data is None:
+            raise RuntimeError("cavab oxunmadı")
+        if _gm["logged"] < 3:                      # ilk cavabların qısa nümunəsi (açar yazılmır)
+            _gm["logged"] += 1
+            logging.info("GoMap %s nümunə: %s", method, body[:300].replace(GOMAP_KEY, "***"))
+        _gm["fail"] = 0
+        return data
+    except Exception as e:
+        _gm["fail"] += 1
+        logging.warning("GoMap %s alınmadı: %s", method, str(e).replace(GOMAP_KEY, "***")[:120])
+        if _gm["fail"] >= 3:
+            _gm["until"] = time.monotonic() + 120
+            _gm["fail"] = 0
+        return None
+
+
+def _gm_label(row) -> str:
+    nm, addr = str(row.get("nm") or "").strip(), str(row.get("addr") or "").strip()
+    addr = re.sub(r",?\s*AZ\s?\d{4}\s*$", "", addr, flags=re.I).strip(" ,")          # poçt indeksi
+    addr = re.sub(r",?\s*Az[eə]rbaijan\s*$", "", addr, flags=re.I).strip(" ,")      # ölkə adı
+    addr = re.sub(r",?\s*Az[eə]rbay?can\s*$", "", addr, flags=re.I).strip(" ,")
+    return _join_parts([nm, addr], limit=90) or nm or addr
+
+
+async def gomap_search(text: str, near=None):
+    """Axtarış: GoMap nəticələri (öz bazası + Google keşi). Eyni yerdəkilər birləşdirilir, ən çoxu 5."""
+    text = (text or "").strip()
+    if not GOMAP_KEY or not text:
+        return []
+    lat, lon = near if near else (BAKU_LAT, BAKU_LON)
+    ck = (norm(text), round(lat, 2), round(lon, 2))
+    hit = _gm["cache"].get(ck)
+    if hit and time.monotonic() - hit[0] < 600:
+        return [dict(c) for c in hit[1]]
+    data = await _gomap_call("SearchUnified", {"q": text, "lng": "az", "lat": f"{lat:.6f}", "lon": f"{lon:.6f}"})
+    rows = (data or {}).get("rows") or []
+    kept = []
+    for r in sorted(rows, key=lambda r: -float(r.get("score") or 0)):
+        try:
+            rlat, rlon = float(r["y"]), float(r["x"])
+        except Exception:
+            continue
+        if dist_km(BAKU_LAT, BAKU_LON, rlat, rlon) > GEO_RADIUS_KM:
+            continue
+        if dist_km(SUMGAIT_LAT, SUMGAIT_LON, rlat, rlon) < SUMGAIT_ZONE_KM:
+            continue
+        near_k = [k for k in kept if dist_km(k["lat"], k["lon"], rlat, rlon) < GM_CLUSTER_KM]
+        if near_k:
+            k = near_k[0]
+            if k.get("src") == "google_cache" and r.get("source") == "gomap" and r.get("addr") and not k.get("fixed"):
+                k["label"] = _gm_label({"nm": k["nm"], "addr": r.get("addr")})      # Google ünvanı qəribədirsə, GoMap ünvanı götürülür
+                k["fixed"] = True
+            continue
+        label = _gm_label(r)
+        if not label:
+            continue
+        kept.append({"lat": rlat, "lon": rlon, "label": label, "raw": float(r.get("score") or 0), "baku": True,
+                     "order": len(kept), "dist": float(r.get("dist") or dist_km(lat, lon, rlat, rlon)),
+                     "src": r.get("source"), "nm": str(r.get("nm") or "")})
+        if len(kept) == 5:
+            break
+    for i, c in enumerate(kept):                   # "dəqiq uyğunluq": yüksək xal və növbətidən aydın fərq
+        nxt = kept[i + 1]["raw"] if i + 1 < len(kept) else 0
+        c["score"] = 1.0 if (i == 0 and c["raw"] >= 90 and nxt <= c["raw"] - 25) else 0.5
+    if kept:
+        if len(_gm["cache"]) > 500:
+            _gm["cache"].clear()
+        _gm["cache"][ck] = (time.monotonic(), [dict(c) for c in kept])
+    return kept
+
+
+async def gomap_reverse_label(lat, lon):
+    """Koordinatdan ünvan (getAddressByCoords). Cavab formatı qeyri-müəyyəndir, ona görə ehtiyatla oxunur."""
+    data = await _gomap_call("getAddressByCoords", {"x": f"{lon:.6f}", "y": f"{lat:.6f}", "lng": "az"}, timeout=6)
+    if not isinstance(data, dict):
+        return None
+    rows = data.get("rows")
+    row = rows[0] if isinstance(rows, list) and rows else data
+    if not isinstance(row, dict):
+        return None
+    try:                                           # nöqtə göstərilibsə, istənilən yerdən 1 km-dən uzaq olmasın
+        if dist_km(lat, lon, float(row["y"]), float(row["x"])) > 1.0:
+            return None
+    except Exception:
+        pass
+    label = _gm_label({"nm": row.get("nm") if row.get("nm") != row.get("addr") else "", "addr": row.get("addr") or row.get("address")})
+    return label or None
+
+
 async def geocode(text: str, near=None):
     """Ünvanı axtarır (yalnız Bakı radiusu). near=(lat, lon) müştərinin yeridir: eyni dərəcədə uyğun
     nəticələrdən ona yaxın olan öndə göstərilir. Nəticə: [{lat, lon, label, score, baku}], ən çoxu 5."""
@@ -541,6 +663,9 @@ async def geocode(text: str, near=None):
     own = search_places(toks, near)
     if own:  # öz siyahımız həmişə birincidir
         return own[:5]
+    gm = await gomap_search(text, near)
+    if gm:
+        return _disambiguate(gm)
     primary = correct_query(text)
     found: dict = {}
     numbered = numbered_variants(text, toks)
@@ -743,7 +868,8 @@ async def _pelias_reverse_label(lat, lon):
 
 async def reverse_label(lat, lon):
     """Koordinatın real ünvanı. Əvvəl OpenStreetMap-ın öz xidməti (kənd və rayon adlarını da verir), alınmasa Pelias."""
-    return await _nominatim_label(lat, lon) or await _pelias_reverse_label(lat, lon)
+    return (await gomap_reverse_label(lat, lon) or await _nominatim_label(lat, lon)
+            or await _pelias_reverse_label(lat, lon))
 
 
 async def fill_pickup_label(oid: int, lat, lon):
