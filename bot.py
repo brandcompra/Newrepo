@@ -13,6 +13,7 @@ import sqlite3
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
@@ -54,6 +55,13 @@ PORT = int(os.environ.get("PORT", "8080"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
 if WEBAPP_URL and not WEBAPP_URL.startswith("http"):
     WEBAPP_URL = "https://" + WEBAPP_URL
+
+# WhatsApp (müştəri tərəfi, Meta Cloud API). Dəyərlər yalnız hostingin "Variables" bölməsində yazılır, söhbətdə paylaşılmır.
+WA_TOKEN = os.environ.get("WA_TOKEN", "").strip()                # Meta access token
+WA_PHONE_ID = os.environ.get("WA_PHONE_ID", "").strip()          # Phone number ID
+WA_VERIFY_TOKEN = os.environ.get("WA_VERIFY_TOKEN", "").strip()  # webhook qeydiyyatında özümüzün seçdiyimiz gizli söz
+WA_APP_SECRET = os.environ.get("WA_APP_SECRET", "").strip()      # Meta app secret (gələn sorğunun imzasını yoxlamaq üçün)
+WA_API_VERSION = os.environ.get("WA_API_VERSION", "v23.0").strip()
 
 RADIUS_KM = float(os.environ.get("RADIUS_KM", "1.3"))
 LOC_MAX_AGE_MIN = int(os.environ.get("LOC_MAX_AGE_MIN", "12"))
@@ -1105,8 +1113,10 @@ def order_driver_kb(o) -> InlineKeyboardMarkup:
 
 def driver_dm_text(o) -> str:
     """Sifarişi qəbul edənin şəxsi mesajı (mərhələ sonda qısa sətirlə göstərilir)."""
+    cname = (esc(o['customer_name']) if is_wa(o["customer_id"])           # WhatsApp müştərisində Telegram linki yoxdur
+             else f"<a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>")
     txt = ("✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
-           + f"\n\n👤 ⭐ {customer_rating_str(o['customer_id'])} <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
+           + f"\n\n👤 ⭐ {customer_rating_str(o['customer_id'])} {cname}"
            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else "")
            + (f"\nQəbul edən şəxsin telefonu: {esc(o['recv_phone'])}" if o["recv_phone"] else ""))
     if o["status"] == "done":
@@ -1555,6 +1565,7 @@ async def start_web():
         web.get("/api/online", api_online), web.get("/api/track", api_track),
         web.get("/phones", phones_page), web.post("/api/phones", api_phones),
         web.get("/locate", locate_page), web.post("/api/pickup", api_pickup),
+        web.get("/wa/webhook", wa_verify), web.post("/wa/webhook", wa_incoming),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1774,6 +1785,9 @@ async def _set_plabel(p: dict, lat, lon):
 
 async def send_map(bot, chat_id, lat, lon, title=None, address=None):
     """Xəritə mesajı göndərir. title verilibsə, xəritənin altında yazı ilə (məs. «Götürülmə yeri») görünür."""
+    if is_wa(chat_id):                                         # WhatsApp müştərisi
+        await wa_send_location(chat_id, lat, lon, title, address)
+        return
     try:
         if title:
             await bot.send_venue(chat_id, lat, lon, title=str(title)[:100] or "Yer", address=str(address or "—")[:200])
@@ -2110,9 +2124,9 @@ async def run_offers(bot, oid: int, exclude=()):
     if n:
         o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
         try:
-            await bot.send_message(o["customer_id"],
-                                   f"😕 Hazırda sifarişi qəbul edən {wlabel} tapılmadı. Bir az sonra yenidən cəhd edin.",
-                                   reply_markup=with_home())
+            await notify_customer(bot, o["customer_id"],
+                                  f"😕 Hazırda sifarişi qəbul edən {wlabel} tapılmadı. Bir az sonra yenidən cəhd edin.",
+                                  reply_markup=with_home())
         except Exception:
             pass
         try:
@@ -2142,8 +2156,8 @@ async def dispatch_order(bot, uid: int, uname: str, p: dict):
     if not plabel:
         spawn(fill_pickup_label(oid, p["plat"], p["plon"]))   # alınmayıbsa sonradan tarixçə üçün doldurulur
     cour = p.get("kind") == "courier"
-    await bot.send_message(
-        uid, f"🔎 Sifariş #{oc(oid)} üçün yaxın {'kuryer' if cour else 'sürücü'} axtarılır. Qəbul edən kimi məlumat gələcək.",
+    await notify_customer(
+        bot, uid, f"🔎 Sifariş #{oc(oid)} üçün yaxın {'kuryer' if cour else 'sürücü'} axtarılır. Qəbul edən kimi məlumat gələcək.",
         reply_markup=kb_home(cancel_kb(oid)),
     )
     spawn(run_offers(bot, oid))
@@ -2221,8 +2235,8 @@ async def accept(cb: CallbackQuery):
         except Exception:
             logging.warning("edit failed for chat %s", r["chat_id"])
 
-    cmsg = await cb.bot.send_message(o["customer_id"], driver_card(d, o), reply_markup=order_customer_kb(oid))
-    execute("UPDATE orders SET cust_msg_id=? WHERE id=?", (cmsg.message_id, oid))
+    cmsg = await notify_customer(cb.bot, o["customer_id"], driver_card(d, o), reply_markup=order_customer_kb(oid))
+    execute("UPDATE orders SET cust_msg_id=? WHERE id=?", (cmsg.message_id, oid))      # WhatsApp müştərisində None
     # qəbul edənə iki xəritə mesajı: götürülmə yeri və gediləcək yer (düymələr olan mesaj ən sonda qalır)
     await send_map(cb.bot, d["user_id"], o["plat"], o["plon"], title="📍 Götürülmə yeri",
                    address=o["pickup_label"] or "Müştərinin yeri")
@@ -2280,7 +2294,7 @@ async def arrived(cb: CallbackQuery):
     o = await _refresh_driver_msg(cb, oid)
     who = "Kuryer" if o["kind"] == "courier" else "Sürücü"
     try:
-        await cb.bot.send_message(o["customer_id"], f"📍 {who} çatdı, sizi gözləyir.")
+        await notify_customer(cb.bot, o["customer_id"], f"📍 {who} çatdı, sizi gözləyir.")
     except Exception:
         logging.warning("customer %s notify failed", o["customer_id"])
     await cb.answer("Müştəri xəbərdar edildi ✅")
@@ -2305,7 +2319,7 @@ async def trip_start(cb: CallbackQuery):
         except Exception:
             pass
     try:
-        await cb.bot.send_message(o["customer_id"], "🛵 Çatdırılma başladı." if cour else "▶️ Gediş başladı.")
+        await notify_customer(cb.bot, o["customer_id"], "🛵 Çatdırılma başladı." if cour else "▶️ Gediş başladı.")
     except Exception:
         logging.warning("customer %s notify failed", o["customer_id"])
     await cb.answer()
@@ -2337,8 +2351,8 @@ async def finish(cb: CallbackQuery):
             pass
     who = "kuryeri" if o["kind"] == "courier" else "sürücünü"
     try:
-        await cb.bot.send_message(o["customer_id"], f"✅ Sifariş #{oc(oid)} tamamlandı. Təşəkkür edirik! 🙏\n\n<b>{who.capitalize()} qiymətləndirin:</b>",
-                                  reply_markup=stars_kb(oid, "w"))
+        await notify_customer(cb.bot, o["customer_id"], f"✅ Sifariş #{oc(oid)} tamamlandı. Təşəkkür edirik! 🙏\n\n<b>{who.capitalize()} qiymətləndirin:</b>",
+                              reply_markup=stars_kb(oid, "w"))
     except Exception:
         logging.warning("customer %s notify failed", o["customer_id"])
     await cb.answer()
@@ -2533,8 +2547,8 @@ async def driver_cancel_do(cb: CallbackQuery):
     execute("DELETE FROM notifs WHERE order_id=?", (oid,))
     excl = {r["driver_id"] for r in fetchall(
         "SELECT driver_id FROM order_cancels WHERE order_id=? AND who='driver'", (oid,))}
-    await cb.bot.send_message(o["customer_id"], f"⚠️ {wlabel} imtina etdi. Sizə yenisini axtarırıq…",
-                              reply_markup=cancel_kb(oid))
+    await notify_customer(cb.bot, o["customer_id"], f"⚠️ {wlabel} imtina etdi. Sizə yenisini axtarırıq…",
+                          reply_markup=cancel_kb(oid))
     spawn(run_offers(cb.bot, oid, exclude=excl))
     if cnt >= CANCEL_WARN:
         await cb.bot.send_message(uid, f"⚠️ Son 24 saatda {cnt} dəfə imtina etmisiniz. Çox imtina etmək olmaz.")
@@ -3009,6 +3023,338 @@ async def _do_restore(m: Message, doc):
         await m.answer("✅ Baza bərpa olundu.\n" + _counts())
 
 
+# ---------- WhatsApp: müştəri tərəfi (Meta Cloud API) ----------
+# Müştəri WhatsApp-da yazır; mövcud Telegram axını (ünvan, qiymət, sürücü təklifi) eyni funksiyalarla işləyir.
+# WhatsApp müştərisinin daxili id-si: -(WA_BASE + telefon). Telegram id-ləri ilə (qrup id-ləri daxil) toqquşmur.
+WA_BASE = 2_000_000_000_000_000
+WA_MENU_WORDS = {"menu", "menyu", "start", "/start", "salam", "hi", "hello", "hey", "merhaba", "привет", "0",
+                 "evvele qayit", "ləğv", "legv", "cancel", "baslat"}
+
+
+def wa_uid(phone) -> int:
+    return -(WA_BASE + int(phone))
+
+
+def is_wa(uid) -> bool:
+    return isinstance(uid, int) and uid <= -WA_BASE
+
+
+def wa_phone(uid) -> str:
+    return str(-uid - WA_BASE)
+
+
+def wa_text(s) -> str:
+    """Telegram HTML mətnini WhatsApp mətninə çevirir (qalın *…*, əyri _…_, linklər mötərizədə)."""
+    s = str(s or "")
+    s = re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', r"\2 (\1)", s, flags=re.S)
+    s = re.sub(r"</?(?:b|strong)>", "*", s)
+    s = re.sub(r"</?(?:i|em)>", "_", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return html.unescape(s).strip()
+
+
+def wa_choices(markup):
+    """Inline düymələrdən (callback_data, mətn) siyahısı. Mini App / link düymələri WhatsApp-da yoxdur, atılır."""
+    out = []
+    rows = getattr(markup, "inline_keyboard", None) or []          # ReplyKeyboardMarkup və s. burada yoxdur
+    for row in rows:
+        for b in row:
+            d = b.get("callback_data") if isinstance(b, dict) else getattr(b, "callback_data", None)
+            t = b.get("text") if isinstance(b, dict) else getattr(b, "text", None)
+            if d:
+                out.append((d, t or d))
+    return out
+
+
+def wa_payload(to: str, text, markup=None) -> dict:
+    """≤3 düymə: cavab düymələri; daha çox: siyahı (ən çox 10); düymə yoxdursa adi mətn."""
+    base = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to}
+    ch = wa_choices(markup)
+    plain = wa_text(text)
+    if not ch:
+        return {**base, "type": "text", "text": {"body": plain[:4000] or "—", "preview_url": False}}
+    body = (plain[:1021] + "…") if len(plain) > 1024 else (plain or "—")
+    if len(ch) <= 3:
+        btns = [{"type": "reply", "reply": {"id": d[:256], "title": t[:20]}} for d, t in ch]
+        return {**base, "type": "interactive",
+                "interactive": {"type": "button", "body": {"text": body}, "action": {"buttons": btns}}}
+    rows = []
+    for d, t in ch[:10]:
+        r = {"id": d[:200], "title": t[:24] if len(t) <= 24 else t[:23] + "…"}
+        if len(t) > 24:
+            r["description"] = t[:72]
+        rows.append(r)
+    return {**base, "type": "interactive",
+            "interactive": {"type": "list", "body": {"text": body},
+                            "action": {"button": "Seçin", "sections": [{"title": "Seçimlər", "rows": rows}]}}}
+
+
+async def wa_post(payload: dict):
+    """Graph API-yə mesaj göndərir. Uğursuzluqda None qaytarır (xəta log-a yazılır, bot dayanmır)."""
+    if not (WA_TOKEN and WA_PHONE_ID):
+        logging.warning("WhatsApp ayarları (WA_TOKEN, WA_PHONE_ID) yoxdur, mesaj göndərilmədi")
+        return None
+    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+            async with s.post(url, json=payload, headers={"Authorization": f"Bearer {WA_TOKEN}"}) as r:
+                data = await r.json(content_type=None)
+                if r.status >= 400:
+                    logging.warning("WhatsApp göndərmə xətası %s: %s", r.status, str(data)[:300])
+                    return None
+                return data
+    except Exception:
+        logging.exception("WhatsApp göndərmə xətası")
+        return None
+
+
+async def wa_reply(uid: int, text, markup=None):
+    return await wa_post(wa_payload(wa_phone(uid), text, markup))
+
+
+async def wa_send_location(uid: int, lat, lon, title=None, address=None):
+    loc = {"latitude": lat, "longitude": lon}
+    if title:
+        loc["name"] = str(title)[:100]
+    if address:
+        loc["address"] = str(address)[:200]
+    return await wa_post({"messaging_product": "whatsapp", "to": wa_phone(uid), "type": "location", "location": loc})
+
+
+async def notify_customer(bot, cid: int, text, reply_markup=None):
+    """Müştəriyə mesaj: Telegram müştərisinə bot, WhatsApp müştərisinə Cloud API ilə. Nəticədə .message_id var (WhatsApp-da None)."""
+    if is_wa(cid):
+        await wa_reply(cid, text, reply_markup)
+        return SimpleNamespace(message_id=None)
+    return await bot.send_message(cid, text, reply_markup=reply_markup)
+
+
+class WAMsg:
+    """aiogram Message əvəzi: mövcud axın funksiyaları (on_text, quote, …) WhatsApp müştərisi üçün də işləsin."""
+
+    def __init__(self, uid: int, name: str, text=None, loc=None):
+        self.from_user = SimpleNamespace(id=uid, full_name=name, first_name=name, username=None)
+        self.chat = SimpleNamespace(id=uid)
+        self.text = text
+        self.location = SimpleNamespace(latitude=loc[0], longitude=loc[1], live_period=None) if loc else None
+        self.bot = BOT_REF.get("bot")
+        self.message_id = None
+
+    async def answer(self, text, reply_markup=None, **kw):
+        await wa_reply(self.chat.id, text, reply_markup)
+
+    async def edit_text(self, text, reply_markup=None, **kw):       # WhatsApp-da mesaj redaktə olunmur: yeni mesaj gedir
+        await wa_reply(self.chat.id, text, reply_markup)
+
+    async def edit_reply_markup(self, reply_markup=None, **kw):
+        pass
+
+    async def delete(self):
+        pass
+
+
+class WACb:
+    """aiogram CallbackQuery əvəzi (düymə / siyahı seçimi)."""
+
+    def __init__(self, uid: int, name: str, data: str):
+        self.from_user = SimpleNamespace(id=uid, full_name=name, first_name=name, username=None)
+        self.data = data
+        self.message = WAMsg(uid, name)
+        self.bot = BOT_REF.get("bot")
+
+    async def answer(self, text=None, show_alert=False, **kw):
+        if text:
+            await wa_reply(self.from_user.id, text)
+
+
+async def wa_menu(uid: int):
+    pending.pop(uid, None)
+    await wa_reply(uid, "Salam 👋 Nə lazımdır?", customer_menu_kb())
+
+
+async def wa_ask_location(uid: int, kind: str, first: str = ""):
+    head = f"{kind_title(kind)} çağırmaq üçün götürülmə yerini göndərin."
+    body = ((first + "\n\n") if first else "") + head + (
+        "\nAşağıdakı düyməyə basın və ya 📎 → Yer (Location) ilə istənilən nöqtəni seçin."
+        "\n\nƏvvələ qayıtmaq üçün «menu» yazın.")
+    res = await wa_post({"messaging_product": "whatsapp", "to": wa_phone(uid), "type": "interactive",
+                         "interactive": {"type": "location_request_message", "body": {"text": body[:1024]},
+                                         "action": {"name": "send_location"}}})
+    if not res:                                                    # bu mesaj növü qəbul olunmasa, adi mətn
+        await wa_reply(uid, body)
+
+
+async def wa_choose(uid: int, kind: str):
+    pending[uid] = {"kind": kind}
+    await wa_ask_location(uid, kind)
+
+
+async def wa_next_step(msg: WAMsg, uid: int, uname: str, p: dict):
+    """Təsdiqdən sonra: telefon nömrəsi artıq WhatsApp-dan məlumdur. Kuryerdə yalnız qəbul edənin nömrəsi soruşulur."""
+    if p.get("kind") == "courier" and not p.get("recv_phone"):
+        p["await_recv"] = True
+        await msg.answer("📱 Bağlamanı qəbul edən şəxsin telefon nömrəsini yazın (məs. 0557654321).")
+        return
+    pending.pop(uid, None)
+    await dispatch_order(BOT_REF["bot"], uid, uname, p)
+
+
+async def wa_button(uid: int, name: str, data: str):
+    cb = WACb(uid, name, data)
+    if data in ("order:taxi", "order:courier"):
+        await wa_choose(uid, "courier" if data == "order:courier" else "taxi")
+    elif data in ("home", "role:customer"):
+        await wa_menu(uid)
+    elif data == "my":
+        await cb.message.answer(customer_history_text(uid))
+    elif data.startswith("g:"):
+        await pick_candidate(cb)
+    elif data == "q_far":
+        await quote_far(cb)
+    elif data == "q_edit":
+        await quote_edit(cb)
+    elif data == "q_no":
+        await quote_cancel(cb)
+        await wa_menu(uid)
+    elif data == "q_ok":
+        p = pending.get(uid)
+        if not p or "price" not in p:
+            await cb.message.answer("Sifariş vaxtı keçib. Yenidən başlamaq üçün «menu» yazın.")
+        else:
+            await wa_next_step(cb.message, uid, name, p)
+    elif data.startswith("cx:"):
+        await customer_cancel(cb)
+    elif data.startswith("cxa:"):
+        await customer_cancel_ask(cb)
+    elif data.startswith("cyy:"):
+        await customer_cancel_do(cb)
+    elif data.startswith("cyn:"):
+        await cancel_dismiss(cb)
+    elif data.startswith("rt:"):
+        await rate(cb)
+    elif data.startswith("rs:"):
+        await rate_skip(cb)
+    else:
+        await wa_menu(uid)
+
+
+async def wa_text_in(uid: int, name: str, text: str):
+    msg = WAMsg(uid, name, text=text)
+    if norm(text) in WA_MENU_WORDS or text.strip().lower() in WA_MENU_WORDS or text.strip() == BACK_TEXT:
+        await wa_menu(uid)
+        return
+    if uid in awaiting_comment and await save_comment(msg):
+        return
+    p = pending.get(uid)
+    if p and p.get("await_recv"):
+        ph = parse_phone(text)
+        if not ph:
+            await msg.answer("Nömrə düzgün deyil. Məsələn: 0557654321")
+            return
+        p["recv_phone"] = ph
+        p.pop("await_recv", None)
+        pending.pop(uid, None)
+        await dispatch_order(BOT_REF["bot"], uid, name, p)
+        return
+    if not p or not p.get("kind"):
+        await wa_menu(uid)
+        return
+    if "plat" not in p:
+        await wa_ask_location(uid, p["kind"], "Əvvəlcə götürülmə yerini göndərin 👇")
+        return
+    await on_text(msg)                                            # ünvan axtarışı, çəki, qiymət: Telegram ilə eyni məntiq
+
+
+async def wa_location_in(uid: int, name: str, lat: float, lon: float):
+    p = pending.get(uid)
+    if not p or not p.get("kind"):
+        await wa_menu(uid)
+        return
+    await on_location(WAMsg(uid, name, loc=(lat, lon)))
+
+
+_wa_seen: dict = {}                                               # təkrar çatdırılan webhook-lara qarşı (Meta bəzən təkrar göndərir)
+_wa_locks: dict = {}
+
+
+async def _wa_handle(uid: int, phone: str, name: str, m: dict):
+    execute("INSERT INTO customers(user_id,name,phone) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, phone=excluded.phone", (uid, name, "+" + phone))
+    t = m.get("type")
+    if t == "text":
+        await wa_text_in(uid, name, (m.get("text") or {}).get("body", ""))
+    elif t == "interactive":
+        it = m.get("interactive") or {}
+        rep = it.get("button_reply") or it.get("list_reply") or {}
+        await wa_button(uid, name, rep.get("id", ""))
+    elif t == "location":
+        loc = m.get("location") or {}
+        if "latitude" in loc and "longitude" in loc:
+            await wa_location_in(uid, name, float(loc["latitude"]), float(loc["longitude"]))
+    elif t == "button":                                           # şablon düyməsi (gələcək üçün)
+        await wa_menu(uid)
+    else:
+        await wa_reply(uid, "Yalnız mətn və yer (Location) göndərə bilərsiniz. Başlamaq üçün «menu» yazın.")
+
+
+async def wa_handle(phone: str, name: str, m: dict):
+    uid = wa_uid(phone)
+    lock = _wa_locks.setdefault(uid, asyncio.Lock())              # eyni müştərinin mesajları ardıcıl işlənir
+    async with lock:
+        try:
+            await _wa_handle(uid, phone, name, m)
+        except Exception:
+            logging.exception("WhatsApp mesajı işlənmədi")
+            try:
+                await wa_reply(uid, "Xəta baş verdi. Bir az sonra yenidən cəhd edin.")
+            except Exception:
+                pass
+
+
+async def wa_process(data: dict):
+    for entry in data.get("entry") or []:
+        for ch in entry.get("changes") or []:
+            v = ch.get("value") or {}
+            names = {c.get("wa_id"): (c.get("profile") or {}).get("name") for c in v.get("contacts") or []}
+            for m in v.get("messages") or []:
+                mid = m.get("id")
+                if not mid or mid in _wa_seen:
+                    continue
+                _wa_seen[mid] = time.time()
+                while len(_wa_seen) > 2000:
+                    _wa_seen.pop(next(iter(_wa_seen)))
+                frm = re.sub(r"\D", "", str(m.get("from", "")))
+                if not frm or len(frm) > 15:
+                    continue
+                spawn(wa_handle(frm, names.get(m.get("from")) or "Müştəri", m))
+
+
+async def wa_verify(request):
+    """Meta webhook-u qeydiyyatdan keçirəndə (GET) göndərdiyi yoxlama."""
+    q = request.query
+    if (WA_VERIFY_TOKEN and q.get("hub.mode") == "subscribe"
+            and hmac.compare_digest(q.get("hub.verify_token", ""), WA_VERIFY_TOKEN)):
+        return web.Response(text=q.get("hub.challenge", ""))
+    return web.Response(status=403, text="forbidden")
+
+
+async def wa_incoming(request):
+    raw = await request.read()
+    if not WA_APP_SECRET:
+        logging.warning("WA_APP_SECRET yoxdur: WhatsApp sorğusu imzasız qəbul edilmir")
+        return web.Response(status=403, text="forbidden")
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    exp = "sha256=" + hmac.new(WA_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, exp):
+        return web.Response(status=403, text="bad signature")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return web.Response(status=400, text="bad json")
+    spawn(wa_process(data))
+    return web.Response(text="ok")                                # Meta tez cavab gözləyir; işləmə arxa planda gedir
+
+
 # ---------- Başlat ----------
 async def main():
     init_db()
@@ -3025,7 +3371,7 @@ async def main():
     for r in fetchall("SELECT id, customer_id FROM orders WHERE status='new'"):    # bot yenidən başlayıb: axtarışı yarımçıq qalan sifarişlər
         execute("UPDATE orders SET status='nodriver', cur_driver=NULL WHERE id=?", (r["id"],))
         try:
-            await bot.send_message(r["customer_id"], f"😕 Sifariş #{oc(r['id'])} üzrə axtarış yarımçıq qaldı. Zəhmət olmasa yenidən sifariş verin.")
+            await notify_customer(bot, r["customer_id"], f"😕 Sifariş #{oc(r['id'])} üzrə axtarış yarımçıq qaldı. Zəhmət olmasa yenidən sifariş verin.")
         except Exception:
             pass
     spawn(backup_loop(bot))
