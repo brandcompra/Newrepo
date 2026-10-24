@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import time
@@ -43,9 +44,9 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROUP_ID = int(os.environ.get("GROUP_ID", "0") or 0)             # köhnə qrup (artıq istifadə olunmur, boş ola bilər)
 COURIER_GROUP_ID = int(os.environ.get("COURIER_GROUP_ID", "0") or 0)  # köhnə kuryer qrupu (artıq istifadə olunmur)
-OFFER_SECONDS = int(os.environ.get("OFFER_SECONDS", "13"))      # sürücünün cavab müddəti (saniyə)
-REMIND_AT = float(os.environ.get("REMIND_AT", "6"))               # neçənci saniyədə ikinci xəbərdarlıq mesajı gəlsin
-MAX_OFFERS = int(os.environ.get("MAX_OFFERS", "10"))            # bir sifariş üçün ən çox neçə sürücüyə ardıcıl təklif
+OFFER_SECONDS = int(os.environ.get("OFFER_SECONDS", "25"))      # sürücünün cavab müddəti (saniyə)
+REMIND_AT = float(os.environ.get("REMIND_AT", "12"))               # neçənci saniyədə ikinci xəbərdarlıq mesajı gəlsin
+MAX_OFFERS = int(os.environ.get("MAX_OFFERS", "5"))            # bir sifariş üçün ən çox neçə sürücüyə ardıcıl təklif
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 ORS_KEY = os.environ["ORS_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "taxi.db")
@@ -78,6 +79,18 @@ GEOCODE_URL = "https://api.heigit.org/pelias/v1/search"
 
 router = Router()
 pending: dict[int, dict] = {}
+
+CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"        # O, I, 0, 1 yoxdur (qarışmasın)
+
+
+def gen_code(used) -> str:
+    rnd = random.SystemRandom()
+    for n in (4, 4, 4, 4, 5, 6):
+        for _ in range(50):
+            c = "".join(rnd.choice(CODE_ALPHABET) for _ in range(n))
+            if c not in used:
+                return c
+    return "".join(rnd.choice(CODE_ALPHABET) for _ in range(8))
 
 
 def group_for(kind: str) -> int:
@@ -130,9 +143,6 @@ def init_db():
             kind TEXT DEFAULT 'taxi',
             PRIMARY KEY (user_id, kind)
         );
-        CREATE TABLE IF NOT EXISTS user_lang(
-            user_id INTEGER PRIMARY KEY, lang TEXT
-        );
         CREATE TABLE IF NOT EXISTS active_role(
             user_id INTEGER PRIMARY KEY, kind TEXT
         );
@@ -175,12 +185,19 @@ def init_db():
         ("orders", "weight", "REAL"), ("orders", "recv_phone", "TEXT"),
         ("orders", "stage", "TEXT"), ("orders", "arrived_at", "TEXT"), ("orders", "started_at", "TEXT"),
         ("orders", "finished_at", "TEXT"), ("orders", "pickup_label", "TEXT"),
-        ("orders", "cur_driver", "INTEGER"), ("orders", "offer_until", "REAL"),
+        ("orders", "cur_driver", "INTEGER"), ("orders", "offer_until", "REAL"), ("orders", "code", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    conn.commit()
+    used = {r[0] for r in conn.execute("SELECT code FROM orders WHERE code IS NOT NULL")}      # köhnə sifarişlərə də kod ver
+    for (oid_,) in conn.execute("SELECT id FROM orders WHERE code IS NULL").fetchall():
+        c = gen_code(used)
+        used.add(c)
+        conn.execute("UPDATE orders SET code=? WHERE id=?", (c, oid_))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_code ON orders(code)")
     conn.commit()
     # köhnə baza: hər istifadəçiyə bir qeyd idi -> indi (istifadəçi, rol) üzrə ayrı qeyd
     pk = [c[1] for c in conn.execute("PRAGMA table_info(drivers)").fetchall() if c[5]]
@@ -904,11 +921,17 @@ def fmt_kg(w) -> str:
     return str(int(w)) if w == int(w) else f"{w:.1f}"
 
 
+def oc(oid) -> str:
+    """Sifarişin göstərilən nömrəsi (4 simvollu kod, məs. 3F61)."""
+    r = fetch("SELECT code FROM orders WHERE id=?", (oid,))
+    return r["code"] if r and r["code"] else str(oid)
+
+
 def kind_title(kind) -> str:
     return "Kuryer" if kind == "courier" else "Taksi"
 
 
-def order_text(o, road_km=None) -> str:
+def order_text(o, road_km=None, customer=False) -> str:
     """Sürücüyə gedən mesaj. İki link heç vaxt alt-alta düşmür, son sətir müştərinin yolunun məsafəsidir.
     Fərdi mesajda götürülmə yerinin yanında mötərizədə sürücüdən yol məsafəsi yazılır."""
     near = f" ({fmt_dist(road_km)})" if road_km is not None else ""
@@ -918,7 +941,7 @@ def order_text(o, road_km=None) -> str:
         pl = None
     where = f": {esc(pl)}" if pl else ""
     lines = [
-        f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['id']}</b>",
+        f"<b>🔔 {kind_title(o['kind'])} sifarişi #{o['code'] or o['id']}</b>",
         f"<a href=\"{waze(o['plat'], o['plon'])}\">📍 Götürülmə yeri</a>{where}{near} 👈",
         f"💸 Ödəniş məbləği: {fmt_money(o['price'])}",
     ]
@@ -928,6 +951,8 @@ def order_text(o, road_km=None) -> str:
         lines.append(f"⚖️ Təxmini çəki: {fmt_kg(o['weight'])} kq")
     lines.append(f"<a href=\"{waze(o['dlat'], o['dlon'])}\">🏁 Gediləcək yer</a>: {esc(o['dest_label'])}")
     lines.append(f"Məsafə: {fmt_dist(o['km'])}")
+    if customer:
+        lines.append(f"👤 ⭐ {customer_rating_str(o['customer_id'])} {esc(first_name(o['customer_name']))}")
     return "\n".join(lines)
 
 
@@ -1081,7 +1106,7 @@ def order_driver_kb(o) -> InlineKeyboardMarkup:
 def driver_dm_text(o) -> str:
     """Sifarişi qəbul edənin şəxsi mesajı (mərhələ sonda qısa sətirlə göstərilir)."""
     txt = ("✅ <b>Sifariş sizə verildi</b>\n\n" + order_text(o)
-           + f"\n\nMüştəri: <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
+           + f"\n\n👤 ⭐ {customer_rating_str(o['customer_id'])} <a href=\"tg://user?id={o['customer_id']}\">{esc(o['customer_name'])}</a>"
            + (f"\nTelefon: {esc(customer_phone(o['customer_id']))}" if customer_phone(o["customer_id"]) else "")
            + (f"\nQəbul edən şəxsin telefonu: {esc(o['recv_phone'])}" if o["recv_phone"] else ""))
     if o["status"] == "done":
@@ -1537,116 +1562,42 @@ async def start_web():
     return runner
 
 
-# ---------- Sürücü/kuryer üçün bildiriş quraşdırma təlimatı (4 dildə) ----------
-GUIDE = {
-    "az": (
+# ---------- Sürücü/kuryer üçün bildiriş quraşdırma təlimatı ----------
+def guide_text() -> str:
+    name = esc(BOT_REF.get("name") or "Yolt")
+    return (
         "🔔 <b>Sifariş bildirişlərini güclü etmək (1 dəfə)</b>\n"
-        f"Sifarişə cəmi {OFFER_SECONDS} saniyə ərzində cavab vermək lazımdır. Bildiriş gec və ya səssiz gəlməsin deyə:\n\n"
-        "1. Bu söhbətin (botun) adına toxunun → <b>Bildirişlər</b> → <b>Fərdiləşdir</b>: uzun və güclü səs seçin, "
-        "titrəməni «Uzun», önəmi «Təcili» edin. Söhbəti heç vaxt səssizə salmayın.\n"
-        "2. Telefon ayarları → Tətbiqlər → Telegram → Bildirişlər: «Şəxsi söhbətlər» önəmi yüksək olsun.\n"
-        "3. Telefon ayarları → Telegram → Batareya: «Məhdudiyyətsiz» seçin (qənaət rejimini söndürün).\n"
-        "4. «Narahat etməyin» rejimində Telegram-a istisna verin.\n"
-        "5. Telegram → Ayarlar → Bildirişlər və səslər: «Popup bildirişləri» (varsa) və «Arxa plan bağlantısı» açıq olsun.\n"
-        "6. Bildiriş/zəng səsini yüksək saxlayın.\n\n"
-        "🍎 <b>iPhone:</b> Ayarlar → Bildirişlər → Telegram: Səslər və Kilid ekranı açıq olsun; Fokus/«Narahat etməyin» rejimində "
-        "Telegram-a icazə verin. Bot söhbətinin adına toxunub səsi də seçə bilərsiniz."
-    ),
-    "ru": (
-        "🔔 <b>Как сделать уведомления о заказах громкими (один раз)</b>\n"
-        f"На заказ даётся всего {OFFER_SECONDS} секунд. Чтобы уведомление не пришло поздно или без звука:\n\n"
-        "1. Нажмите на название этого чата (бота) → <b>Уведомления</b> → <b>Настроить</b>: выберите длинный громкий звук, "
-        "вибрацию «Долгая», приоритет «Срочно». Никогда не отключайте звук чата.\n"
-        "2. Настройки телефона → Приложения → Telegram → Уведомления: у категории «Личные чаты» приоритет высокий.\n"
-        "3. Настройки телефона → Telegram → Батарея: выберите «Без ограничений» (отключите экономию).\n"
-        "4. В режиме «Не беспокоить» добавьте Telegram в исключения.\n"
-        "5. Telegram → Настройки → Уведомления и звуки: включите «Всплывающие уведомления» (если есть) и «Фоновое соединение».\n"
-        "6. Держите громкость уведомлений и звонка высокой.\n\n"
-        "🍎 <b>iPhone:</b> Настройки → Уведомления → Telegram: включите звуки и экран блокировки; в режиме «Фокус»/"
-        "«Не беспокоить» разрешите Telegram. Звук можно выбрать и в чате бота (нажмите на название)."
-    ),
-    "en": (
-        "🔔 <b>Make order alerts loud (one-time setup)</b>\n"
-        f"You only have {OFFER_SECONDS} seconds to answer an order. So the alert never arrives late or silent:\n\n"
-        "1. Tap this chat's (the bot's) name → <b>Notifications</b> → <b>Customize</b>: pick a long, loud sound, "
-        "vibration «Long», priority «Urgent». Never mute this chat.\n"
-        "2. Phone settings → Apps → Telegram → Notifications: set «Private chats» importance to high.\n"
-        "3. Phone settings → Telegram → Battery: choose «Unrestricted» (turn battery saving off).\n"
-        "4. In Do Not Disturb mode, allow Telegram as an exception.\n"
-        "5. Telegram → Settings → Notifications and Sounds: turn on «Popup Notifications» (if available) and «Background Connection».\n"
-        "6. Keep notification/ringtone volume high.\n\n"
-        "🍎 <b>iPhone:</b> Settings → Notifications → Telegram: Sounds and Lock Screen on; allow Telegram in Focus/Do Not Disturb. "
-        "You can also pick the sound by tapping the bot chat's name."
-    ),
-    "tr": (
-        "🔔 <b>Sipariş bildirimlerini güçlü yapma (tek seferlik)</b>\n"
-        f"Siparişe yalnızca {OFFER_SECONDS} saniye içinde cevap vermelisiniz. Bildirim geç veya sessiz gelmesin diye:\n\n"
-        "1. Bu sohbetin (botun) adına dokunun → <b>Bildirimler</b> → <b>Özelleştir</b>: uzun ve güçlü bir ses seçin, "
-        "titreşimi «Uzun», önceliği «Acil» yapın. Sohbeti asla sessize almayın.\n"
-        "2. Telefon ayarları → Uygulamalar → Telegram → Bildirimler: «Özel sohbetler» önemi yüksek olsun.\n"
-        "3. Telefon ayarları → Telegram → Pil: «Kısıtlama yok» seçin (pil tasarrufunu kapatın).\n"
-        "4. «Rahatsız etme» modunda Telegram'a istisna verin.\n"
-        "5. Telegram → Ayarlar → Bildirimler ve sesler: «Açılır bildirimler» (varsa) ve «Arka plan bağlantısı» açık olsun.\n"
-        "6. Bildirim/zil sesini yüksek tutun.\n\n"
-        "🍎 <b>iPhone:</b> Ayarlar → Bildirimler → Telegram: Sesler ve Kilit ekranı açık olsun; Odak/«Rahatsız etme» modunda "
-        "Telegram'a izin verin. Bot sohbetinin adına dokunarak sesi de seçebilirsiniz."
-    ),
-}
-GUIDE_LANGS = (("az", "🇦🇿 AZ"), ("ru", "🇷🇺 RU"), ("en", "🇬🇧 EN"), ("tr", "🇹🇷 TR"))
-
-
-def lang_from_code(code) -> str:
-    c = (code or "").lower()[:2]
-    return c if c in GUIDE else ("az" if not c else "en")
-
-
-def user_lang(uid: int) -> str:
-    r = fetch("SELECT lang FROM user_lang WHERE user_id=?", (uid,))
-    return r["lang"] if r and r["lang"] in GUIDE else "az"
-
-
-def remember_lang(user) -> None:
-    try:
-        execute("INSERT INTO user_lang(user_id,lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
-                (user.id, lang_from_code(getattr(user, "language_code", None))))
-    except Exception:
-        logging.warning("dil yazılmadı")
-
-
-def guide_kb(cur: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=("• " if code == cur else "") + label, callback_data=f"gd:{code}")
-        for code, label in GUIDE_LANGS
-    ]])
+        f"Sifarişə {OFFER_SECONDS} saniyə ərzində cavab vermək lazımdır. Bildiriş gec və ya səssiz gəlməsin deyə:\n\n"
+        f"<b>1.</b> Bu botun ({name}) adına toxunun → <b>Notifications / Уведомления / Bildirimler</b> → "
+        "<b>Customize / Настроить / Özelleştir</b>.\n"
+        "Orada uzun və güclü səs seçin (<b>Sound / Звук / Ses</b>), titrəməni uzun edin "
+        "(<b>Vibrate / Вибрация / Titreşim</b>).\n"
+        "Bu söhbəti heç vaxt səssizə salmayın.\n\n"
+        "<b>2.</b> Telegram → <b>Settings / Настройки / Ayarlar</b> → "
+        "<b>Notifications and Sounds / Уведомления и звуки / Bildirimler ve Sesler</b> → "
+        "<b>Private Chats / Личные чаты / Özel Sohbetler</b>: bildirişlər və səs açıq olsun, "
+        "<b>Popup Notifications / Всплывающие уведомления / Açılır Bildirimler</b> varsa açın.\n\n"
+        "<b>3.</b> Bildiriş və zəng səsini yüksək saxlayın.\n\n"
+        "🍎 <b>iPhone'da ayrıca olaraq:</b> Ayarlar → Bildirişlər → Telegram: Səslər və Kilid ekranı açıq olsun.\n"
+        "Telegramda <b>Notifications and Sounds / Уведомления и звуки / Bildirimler ve Sesler</b> bölməsində "
+        "bunlar açıq (yaşıl) olsun:\n"
+        "• <b>In-App Sounds / Звук / Uygulama içi sesler</b>\n"
+        "• <b>In-App Vibrate / Вибрация / Uygulama içi titreşim</b>\n"
+        "• <b>In-App Preview / Показывать текст / Uygulama içi Önizleme</b>\n"
+        "• <b>Names on Lock Screen / Имена в Уведомлениях / Kilit Ekranında İsimler</b>"
+    )
 
 
 async def send_guide(bot, uid: int):
-    lang = user_lang(uid)
     try:
-        await bot.send_message(uid, GUIDE[lang], reply_markup=guide_kb(lang))
+        await bot.send_message(uid, guide_text())
     except Exception:
         logging.warning("təlimat göndərilmədi: %s", uid)
 
 
 @router.message(Command("telimat"), F.chat.type == ChatType.PRIVATE)
 async def cmd_guide(m: Message):
-    remember_lang(m.from_user)
     await send_guide(m.bot, m.from_user.id)
-
-
-@router.callback_query(F.data.startswith("gd:"))
-async def cb_guide(cb: CallbackQuery):
-    lang = cb.data[3:]
-    if lang not in GUIDE:
-        await cb.answer()
-        return
-    execute("INSERT INTO user_lang(user_id,lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
-            (cb.from_user.id, lang))
-    try:
-        await cb.message.edit_text(GUIDE[lang], reply_markup=guide_kb(lang))
-    except Exception:
-        pass
-    await cb.answer()
 
 
 # ---------- Əsas menyu və rollar ----------
@@ -1659,7 +1610,6 @@ LIVE_HELP = (
 
 @router.message(Command("start", "menu"), F.chat.type == ChatType.PRIVATE)
 async def start(m: Message, state: FSMContext):
-    remember_lang(m.from_user)
     await state.clear()
     pending.pop(m.from_user.id, None)
     await m.answer("Aşağıdakı «Əvvələ qayıt» düyməsi istənilən vaxt əsas menyuya qaytarır.", reply_markup=home_kb())
@@ -2111,7 +2061,7 @@ async def run_offers(bot, oid: int, exclude=()):
         if not cur:
             continue
         until = time.time() + OFFER_SECONDS
-        text = order_text(o, rkm) + f"\n\n⏱ {OFFER_SECONDS} saniyə ərzində cavab verin, yoxsa sifariş başqasına keçəcək."
+        text = order_text(o, rkm, customer=True) + f"\n\n⏱ {OFFER_SECONDS} saniyə ərzində cavab verin, yoxsa sifariş başqasına keçəcək."
         try:
             msg = await bot.send_message(d["user_id"], text, reply_markup=accept_kb(oid))
         except Exception:
@@ -2131,7 +2081,7 @@ async def run_offers(bot, oid: int, exclude=()):
                 if remind_at and rmsg is None and time.time() >= remind_at:       # ikinci bildiriş səsi
                     try:
                         left = max(1, round(until - time.time()))
-                        rmsg = await bot.send_message(d["user_id"], f"⏱ <b>{left} saniyə qalıb!</b> Sifariş #{oid}",
+                        rmsg = await bot.send_message(d["user_id"], f"⏱ <b>{left} saniyə qalıb!</b> Sifariş #{oc(oid)}",
                                                       reply_markup=accept_kb(oid))
                     except Exception:
                         rmsg = False
@@ -2166,7 +2116,7 @@ async def run_offers(bot, oid: int, exclude=()):
         except Exception:
             pass
         try:
-            await bot.send_message(ADMIN_ID, f"ℹ️ Sifariş #{oid}: {len(cands)} {wlabel}yə təklif edildi, heç kim qəbul etmədi.")
+            await bot.send_message(ADMIN_ID, f"ℹ️ Sifariş #{oc(oid)} (ID {oid}): {len(cands)} {wlabel}yə təklif edildi, heç kim qəbul etmədi.")
         except Exception:
             pass
 
@@ -2184,16 +2134,16 @@ async def dispatch_order(bot, uid: int, uname: str, p: dict):
             plabel = None
     _, oid = execute(
         "INSERT INTO orders(customer_id,customer_name,kind,plat,plon,dlat,dlon,dest_label,km,price,note,weight,recv_phone,"
-        "created,pickup_label) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "created,pickup_label,code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (uid, uname, p.get("kind", "taxi"), p["plat"], p["plon"], p["dlat"], p["dlon"], p["label"],
          p["km"], p["price"], p.get("note", ""), p.get("weight"), p.get("recv_phone"), datetime.now(TZ).isoformat(),
-         plabel or None),
+         plabel or None, gen_code({r["code"] for r in fetchall("SELECT code FROM orders WHERE code IS NOT NULL")})),
     )
     if not plabel:
         spawn(fill_pickup_label(oid, p["plat"], p["plon"]))   # alınmayıbsa sonradan tarixçə üçün doldurulur
     cour = p.get("kind") == "courier"
     await bot.send_message(
-        uid, f"🔎 Sifariş #{oid} üçün yaxın {'kuryer' if cour else 'sürücü'} axtarılır. Qəbul edən kimi məlumat gələcək.",
+        uid, f"🔎 Sifariş #{oc(oid)} üçün yaxın {'kuryer' if cour else 'sürücü'} axtarılır. Qəbul edən kimi məlumat gələcək.",
         reply_markup=kb_home(cancel_kb(oid)),
     )
     spawn(run_offers(bot, oid))
@@ -2214,22 +2164,21 @@ async def customer_cancel(cb: CallbackQuery):
                                            chat_id=r["chat_id"], message_id=r["msg_id"], reply_markup=None)
         except Exception:
             logging.warning("edit failed for chat %s", r["chat_id"])
-    await cb.message.edit_text(f"Sifariş #{oid} ləğv edildi.")
+    await cb.message.edit_text(f"Sifariş #{oc(oid)} ləğv edildi.")
     await cb.answer()
 
 
 # ---------- Sürücü: qəbul / imtina / bitirmə ----------
 def driver_card(d, o) -> str:
     price = f"💸 {fmt_money(o['price'])}"
-    avg, cnt = rating_of_worker(d["user_id"], o["kind"])
-    star = [f"⭐ {avg:.1f}"] if cnt >= MIN_RATINGS_SHOWN else []
+    who = f"👤 ⭐ {worker_rating_str(d['user_id'], o['kind'])} {esc(d['name'])}"
     if o["kind"] == "courier":
-        lines = ["✅ <b>Kuryer tapıldı!</b>", f"👤 {esc(d['name'])}", f"📞 {esc(d['phone'])}", f"🛵 {esc(d['car'])}"]
+        lines = ["✅ <b>Kuryer tapıldı!</b>", who, f"📞 {esc(d['phone'])}", f"🛵 {esc(d['car'])}"]
         if d["plate"] and norm(d["plate"]) not in ("yoxdur", "-"):
             lines.append(f"🔢 {esc(d['plate'])}")
-        return "\n".join(lines + star + [price])
-    return "\n".join(["✅ <b>Sürücü tapıldı!</b>", f"👤 {esc(d['name'])}", f"📞 {esc(d['phone'])}",
-                      f"🚗 {esc(d['car'])}", f"🔢 {esc(d['plate'])}"] + star + [price])
+        return "\n".join(lines + [price])
+    return "\n".join(["✅ <b>Sürücü tapıldı!</b>", who, f"📞 {esc(d['phone'])}",
+                      f"🚗 {esc(d['car'])}", f"🔢 {esc(d['plate'])}", price])
 
 
 @router.callback_query(F.data.startswith("acc:"))
@@ -2379,7 +2328,7 @@ async def finish(cb: CallbackQuery):
         except Exception:
             pass
     # sürücü/kuryer dərhal müştərini qiymətləndirir
-    await cb.message.answer(f"✅ Sifariş #{oid} tamamlandı. 💸 {fmt_money(o['price'])}\n\n<b>Müştərini qiymətləndirin:</b>",
+    await cb.message.answer(f"✅ Sifariş #{oc(oid)} tamamlandı. 💸 {fmt_money(o['price'])}\n\n<b>Müştərini qiymətləndirin:</b>",
                             reply_markup=stars_kb(oid, "c"))
     if o["cust_msg_id"]:
         try:
@@ -2388,7 +2337,7 @@ async def finish(cb: CallbackQuery):
             pass
     who = "kuryeri" if o["kind"] == "courier" else "sürücünü"
     try:
-        await cb.bot.send_message(o["customer_id"], f"✅ Sifariş #{oid} tamamlandı. Təşəkkür edirik! 🙏\n\n<b>{who.capitalize()} qiymətləndirin:</b>",
+        await cb.bot.send_message(o["customer_id"], f"✅ Sifariş #{oc(oid)} tamamlandı. Təşəkkür edirik! 🙏\n\n<b>{who.capitalize()} qiymətləndirin:</b>",
                                   reply_markup=stars_kb(oid, "w"))
     except Exception:
         logging.warning("customer %s notify failed", o["customer_id"])
@@ -2396,7 +2345,7 @@ async def finish(cb: CallbackQuery):
 
 
 # ---------- Reytinq ----------
-MIN_RATINGS_SHOWN = int(os.environ.get("MIN_RATINGS_SHOWN", "3"))   # reytinq müştəriyə bu qədər qiymətdən sonra göstərilir
+RATING_PRIOR = int(os.environ.get("RATING_PRIOR", "10"))            # hamı 5.00-la başlayır: əvvəlcədən bu qədər "5 ulduz" sayılır
 LOW_STARS = 2                                                      # bu və ya aşağı qiymətdə admin xəbərdar olunur
 awaiting_comment: dict[int, tuple] = {}                            # istifadəçi -> (sifariş, kim qiymətləndirilir, vaxt)
 
@@ -2412,6 +2361,21 @@ def rating_of_worker(uid: int, kind: str):
     r = fetch("SELECT AVG(r.stars) AS a, COUNT(*) AS c FROM ratings r JOIN orders o ON o.id=r.order_id "
               "WHERE r.target='w' AND o.driver_id=? AND o.kind=?", (uid, kind))
     return (r["a"] or 0.0, r["c"] or 0) if r else (0.0, 0)
+
+
+def smooth_rating(avg: float, cnt: int) -> float:
+    """Qiymət yoxdursa 5.00; hər yeni qiymət reytinqi tədricən dəyişir (əvvəlcədən RATING_PRIOR ədəd 5 ulduz)."""
+    return (5.0 * RATING_PRIOR + (avg or 0.0) * cnt) / (RATING_PRIOR + cnt)
+
+
+def worker_rating_str(uid: int, kind: str) -> str:
+    avg, cnt = rating_of_worker(uid, kind)
+    return f"{smooth_rating(avg, cnt):.2f}"
+
+
+def customer_rating_str(uid: int) -> str:
+    avg, cnt = rating_of_customer(uid)
+    return f"{smooth_rating(avg, cnt):.2f}"
 
 
 def rating_of_customer(uid: int):
@@ -2462,7 +2426,7 @@ async def rate(cb: CallbackQuery):
             who = "Sürücü/kuryer" if target == "c" else "Müştəri"
             whom = "müştərini" if target == "c" else "sürücünü/kuryeri"
             await cb.bot.send_message(ADMIN_ID, f"⚠️ Aşağı reytinq: {who} {whom} {n}⭐ qiymətləndirdi.\n"
-                                      f"Sifariş #{oid} ({kind_title(o['kind'])}), rater ID: {uid}, qiymətləndirilən ID: {ratee}")
+                                      f"Sifariş #{oc(oid)} (ID {oid}, {kind_title(o['kind'])}), rater ID: {uid}, qiymətləndirilən ID: {ratee}")
         except Exception:
             pass
     await cb.answer()
@@ -2490,7 +2454,7 @@ async def save_comment(m: Message) -> bool:
     execute("UPDATE ratings SET comment=? WHERE order_id=? AND target=? AND rater_id=?", (text, oid, target, m.from_user.id))
     await m.answer("Təşəkkürlər, qeyd olundu.", reply_markup=with_home())
     try:
-        await m.bot.send_message(ADMIN_ID, f"📝 Sifariş #{oid} üçün aşağı reytinqin səbəbi:\n{esc(text)}")
+        await m.bot.send_message(ADMIN_ID, f"📝 Sifariş #{oc(oid)} (ID {oid}) üçün aşağı reytinqin səbəbi:\n{esc(text)}")
     except Exception:
         pass
     return True
@@ -2606,7 +2570,7 @@ async def customer_cancel_do(cb: CallbackQuery):
         return
     execute("INSERT INTO order_cancels(order_id,driver_id,who,created) VALUES(?,?,?,?)",
             (oid, o["driver_id"], "customer", time.time()))
-    await cb.message.edit_text(f"Sifariş #{oid} ləğv edildi.")
+    await cb.message.edit_text(f"Sifariş #{oc(oid)} ləğv edildi.")
     if o["cust_msg_id"]:
         try:
             await cb.bot.edit_message_reply_markup(chat_id=o["customer_id"], message_id=o["cust_msg_id"], reply_markup=None)
@@ -2618,7 +2582,7 @@ async def customer_cancel_do(cb: CallbackQuery):
         except Exception:
             pass
     try:
-        await cb.bot.send_message(o["driver_id"], f"🚫 Müştəri #{oid} sifarişini ləğv etdi.")
+        await cb.bot.send_message(o["driver_id"], f"🚫 Müştəri #{oc(oid)} sifarişini ləğv etdi.")
     except Exception:
         pass
     await cb.answer()
@@ -2657,8 +2621,8 @@ def worker_profile_text(uid: int, kind: str) -> str:
              "Bu ay": now.replace(day=1).isoformat(), "Cəmi": ""}
     role = "🛵 Kuryer" if kind == "courier" else "🚕 Sürücü"
     avg, cnt = rating_of_worker(uid, kind)
-    lines = [f"👤 <b>Profilim</b> · {role}", esc(d["name"] if d else "")]
-    lines.append(f"⭐ {avg:.1f} ({cnt} qiymət)" if cnt else "⭐ Hələ qiymət yoxdur")
+    lines = [f"👤 <b>Profilim</b> · {role}", f"⭐ {smooth_rating(avg, cnt):.2f} {esc(d['name'] if d else '')}"]
+    lines.append(f"Qiymət sayı: {cnt}")
     lines += ["", "<b>Qazanc</b>"]
     for title, since in marks.items():
         sel = [r for r in rows if (r["t"] or "") >= since]
@@ -2684,8 +2648,7 @@ def customer_history_text(uid: int) -> str:
     done = [r for r in rows if r["status"] == "done"]
     lines = ["📋 <b>Sifarişlərim</b>", f"Tamamlanan: {len(done)} · Ümumi: {fmt_money(sum(r['price'] or 0 for r in done))}"]
     avg, cnt = rating_of_customer(uid)
-    if cnt >= MIN_RATINGS_SHOWN:
-        lines.append(f"⭐ Reytinqiniz: {avg:.1f} ({cnt} qiymət)")
+    lines.append(f"⭐ Reytinqiniz: {smooth_rating(avg, cnt):.2f} ({cnt} qiymət)")
     lines += ["", "<b>Son sifarişlər</b>"]
     if not rows:
         lines.append("Hələ sifariş yoxdur.")
@@ -3052,13 +3015,17 @@ async def main():
     runner = await start_web()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     BOT_REF["bot"] = bot
+    try:
+        BOT_REF["name"] = (await bot.get_me()).first_name
+    except Exception:
+        pass
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     for r in fetchall("SELECT id, customer_id FROM orders WHERE status='new'"):    # bot yenidən başlayıb: axtarışı yarımçıq qalan sifarişlər
         execute("UPDATE orders SET status='nodriver', cur_driver=NULL WHERE id=?", (r["id"],))
         try:
-            await bot.send_message(r["customer_id"], f"😕 Sifariş #{r['id']} üzrə axtarış yarımçıq qaldı. Zəhmət olmasa yenidən sifariş verin.")
+            await bot.send_message(r["customer_id"], f"😕 Sifariş #{oc(r['id'])} üzrə axtarış yarımçıq qaldı. Zəhmət olmasa yenidən sifariş verin.")
         except Exception:
             pass
     spawn(backup_loop(bot))
