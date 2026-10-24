@@ -41,8 +41,11 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- Ayarlar (hostingdə "Variables" bölməsində yazılır) ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROUP_ID = int(os.environ["GROUP_ID"])                          # taksi sürücüləri qrupu
-COURIER_GROUP_ID = int(os.environ.get("COURIER_GROUP_ID", "0")) or GROUP_ID  # kuryer qrupu (yoxdursa eyni qrup)
+GROUP_ID = int(os.environ.get("GROUP_ID", "0") or 0)             # köhnə qrup (artıq istifadə olunmur, boş ola bilər)
+COURIER_GROUP_ID = int(os.environ.get("COURIER_GROUP_ID", "0") or 0)  # köhnə kuryer qrupu (artıq istifadə olunmur)
+OFFER_SECONDS = int(os.environ.get("OFFER_SECONDS", "13"))      # sürücünün cavab müddəti (saniyə)
+REMIND_AT = float(os.environ.get("REMIND_AT", "6"))               # neçənci saniyədə ikinci xəbərdarlıq mesajı gəlsin
+MAX_OFFERS = int(os.environ.get("MAX_OFFERS", "10"))            # bir sifariş üçün ən çox neçə sürücüyə ardıcıl təklif
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 ORS_KEY = os.environ["ORS_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "taxi.db")
@@ -127,6 +130,9 @@ def init_db():
             kind TEXT DEFAULT 'taxi',
             PRIMARY KEY (user_id, kind)
         );
+        CREATE TABLE IF NOT EXISTS user_lang(
+            user_id INTEGER PRIMARY KEY, lang TEXT
+        );
         CREATE TABLE IF NOT EXISTS active_role(
             user_id INTEGER PRIMARY KEY, kind TEXT
         );
@@ -169,6 +175,7 @@ def init_db():
         ("orders", "weight", "REAL"), ("orders", "recv_phone", "TEXT"),
         ("orders", "stage", "TEXT"), ("orders", "arrived_at", "TEXT"), ("orders", "started_at", "TEXT"),
         ("orders", "finished_at", "TEXT"), ("orders", "pickup_label", "TEXT"),
+        ("orders", "cur_driver", "INTEGER"), ("orders", "offer_until", "REAL"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -1530,6 +1537,118 @@ async def start_web():
     return runner
 
 
+# ---------- Sürücü/kuryer üçün bildiriş quraşdırma təlimatı (4 dildə) ----------
+GUIDE = {
+    "az": (
+        "🔔 <b>Sifariş bildirişlərini güclü etmək (1 dəfə)</b>\n"
+        f"Sifarişə cəmi {OFFER_SECONDS} saniyə ərzində cavab vermək lazımdır. Bildiriş gec və ya səssiz gəlməsin deyə:\n\n"
+        "1. Bu söhbətin (botun) adına toxunun → <b>Bildirişlər</b> → <b>Fərdiləşdir</b>: uzun və güclü səs seçin, "
+        "titrəməni «Uzun», önəmi «Təcili» edin. Söhbəti heç vaxt səssizə salmayın.\n"
+        "2. Telefon ayarları → Tətbiqlər → Telegram → Bildirişlər: «Şəxsi söhbətlər» önəmi yüksək olsun.\n"
+        "3. Telefon ayarları → Telegram → Batareya: «Məhdudiyyətsiz» seçin (qənaət rejimini söndürün).\n"
+        "4. «Narahat etməyin» rejimində Telegram-a istisna verin.\n"
+        "5. Telegram → Ayarlar → Bildirişlər və səslər: «Popup bildirişləri» (varsa) və «Arxa plan bağlantısı» açıq olsun.\n"
+        "6. Bildiriş/zəng səsini yüksək saxlayın.\n\n"
+        "🍎 <b>iPhone:</b> Ayarlar → Bildirişlər → Telegram: Səslər və Kilid ekranı açıq olsun; Fokus/«Narahat etməyin» rejimində "
+        "Telegram-a icazə verin. Bot söhbətinin adına toxunub səsi də seçə bilərsiniz."
+    ),
+    "ru": (
+        "🔔 <b>Как сделать уведомления о заказах громкими (один раз)</b>\n"
+        f"На заказ даётся всего {OFFER_SECONDS} секунд. Чтобы уведомление не пришло поздно или без звука:\n\n"
+        "1. Нажмите на название этого чата (бота) → <b>Уведомления</b> → <b>Настроить</b>: выберите длинный громкий звук, "
+        "вибрацию «Долгая», приоритет «Срочно». Никогда не отключайте звук чата.\n"
+        "2. Настройки телефона → Приложения → Telegram → Уведомления: у категории «Личные чаты» приоритет высокий.\n"
+        "3. Настройки телефона → Telegram → Батарея: выберите «Без ограничений» (отключите экономию).\n"
+        "4. В режиме «Не беспокоить» добавьте Telegram в исключения.\n"
+        "5. Telegram → Настройки → Уведомления и звуки: включите «Всплывающие уведомления» (если есть) и «Фоновое соединение».\n"
+        "6. Держите громкость уведомлений и звонка высокой.\n\n"
+        "🍎 <b>iPhone:</b> Настройки → Уведомления → Telegram: включите звуки и экран блокировки; в режиме «Фокус»/"
+        "«Не беспокоить» разрешите Telegram. Звук можно выбрать и в чате бота (нажмите на название)."
+    ),
+    "en": (
+        "🔔 <b>Make order alerts loud (one-time setup)</b>\n"
+        f"You only have {OFFER_SECONDS} seconds to answer an order. So the alert never arrives late or silent:\n\n"
+        "1. Tap this chat's (the bot's) name → <b>Notifications</b> → <b>Customize</b>: pick a long, loud sound, "
+        "vibration «Long», priority «Urgent». Never mute this chat.\n"
+        "2. Phone settings → Apps → Telegram → Notifications: set «Private chats» importance to high.\n"
+        "3. Phone settings → Telegram → Battery: choose «Unrestricted» (turn battery saving off).\n"
+        "4. In Do Not Disturb mode, allow Telegram as an exception.\n"
+        "5. Telegram → Settings → Notifications and Sounds: turn on «Popup Notifications» (if available) and «Background Connection».\n"
+        "6. Keep notification/ringtone volume high.\n\n"
+        "🍎 <b>iPhone:</b> Settings → Notifications → Telegram: Sounds and Lock Screen on; allow Telegram in Focus/Do Not Disturb. "
+        "You can also pick the sound by tapping the bot chat's name."
+    ),
+    "tr": (
+        "🔔 <b>Sipariş bildirimlerini güçlü yapma (tek seferlik)</b>\n"
+        f"Siparişe yalnızca {OFFER_SECONDS} saniye içinde cevap vermelisiniz. Bildirim geç veya sessiz gelmesin diye:\n\n"
+        "1. Bu sohbetin (botun) adına dokunun → <b>Bildirimler</b> → <b>Özelleştir</b>: uzun ve güçlü bir ses seçin, "
+        "titreşimi «Uzun», önceliği «Acil» yapın. Sohbeti asla sessize almayın.\n"
+        "2. Telefon ayarları → Uygulamalar → Telegram → Bildirimler: «Özel sohbetler» önemi yüksek olsun.\n"
+        "3. Telefon ayarları → Telegram → Pil: «Kısıtlama yok» seçin (pil tasarrufunu kapatın).\n"
+        "4. «Rahatsız etme» modunda Telegram'a istisna verin.\n"
+        "5. Telegram → Ayarlar → Bildirimler ve sesler: «Açılır bildirimler» (varsa) ve «Arka plan bağlantısı» açık olsun.\n"
+        "6. Bildirim/zil sesini yüksek tutun.\n\n"
+        "🍎 <b>iPhone:</b> Ayarlar → Bildirimler → Telegram: Sesler ve Kilit ekranı açık olsun; Odak/«Rahatsız etme» modunda "
+        "Telegram'a izin verin. Bot sohbetinin adına dokunarak sesi de seçebilirsiniz."
+    ),
+}
+GUIDE_LANGS = (("az", "🇦🇿 AZ"), ("ru", "🇷🇺 RU"), ("en", "🇬🇧 EN"), ("tr", "🇹🇷 TR"))
+
+
+def lang_from_code(code) -> str:
+    c = (code or "").lower()[:2]
+    return c if c in GUIDE else ("az" if not c else "en")
+
+
+def user_lang(uid: int) -> str:
+    r = fetch("SELECT lang FROM user_lang WHERE user_id=?", (uid,))
+    return r["lang"] if r and r["lang"] in GUIDE else "az"
+
+
+def remember_lang(user) -> None:
+    try:
+        execute("INSERT INTO user_lang(user_id,lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+                (user.id, lang_from_code(getattr(user, "language_code", None))))
+    except Exception:
+        logging.warning("dil yazılmadı")
+
+
+def guide_kb(cur: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=("• " if code == cur else "") + label, callback_data=f"gd:{code}")
+        for code, label in GUIDE_LANGS
+    ]])
+
+
+async def send_guide(bot, uid: int):
+    lang = user_lang(uid)
+    try:
+        await bot.send_message(uid, GUIDE[lang], reply_markup=guide_kb(lang))
+    except Exception:
+        logging.warning("təlimat göndərilmədi: %s", uid)
+
+
+@router.message(Command("telimat"), F.chat.type == ChatType.PRIVATE)
+async def cmd_guide(m: Message):
+    remember_lang(m.from_user)
+    await send_guide(m.bot, m.from_user.id)
+
+
+@router.callback_query(F.data.startswith("gd:"))
+async def cb_guide(cb: CallbackQuery):
+    lang = cb.data[3:]
+    if lang not in GUIDE:
+        await cb.answer()
+        return
+    execute("INSERT INTO user_lang(user_id,lang) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+            (cb.from_user.id, lang))
+    try:
+        await cb.message.edit_text(GUIDE[lang], reply_markup=guide_kb(lang))
+    except Exception:
+        pass
+    await cb.answer()
+
+
 # ---------- Əsas menyu və rollar ----------
 LIVE_HELP = (
     "📎 → <b>Yer</b> (Location) → <b>Canlı yeri paylaş</b> (Share Live Location) → <b>Mən söndürənə qədər</b> seçin.\n"
@@ -1540,6 +1659,7 @@ LIVE_HELP = (
 
 @router.message(Command("start", "menu"), F.chat.type == ChatType.PRIVATE)
 async def start(m: Message, state: FSMContext):
+    remember_lang(m.from_user)
     await state.clear()
     pending.pop(m.from_user.id, None)
     await m.answer("Aşağıdakı «Əvvələ qayıt» düyməsi istənilən vaxt əsas menyuya qaytarır.", reply_markup=home_kb())
@@ -1955,34 +2075,100 @@ async def quote_ok(cb: CallbackQuery):
 
 
 # ---------- Sifarişin yaradılması və təklif edilməsi ----------
-async def offer_order(bot, oid: int, exclude=()):
-    """Radiusdakı uyğun sürücülərə fərdi, həmçinin qrupa təklif göndərir. (göndərilən, qrup_ok) qaytarır."""
+_runs: dict = {}                                            # sifariş id -> aktiv axtarışın işarəsi
+
+
+def busy_workers(kind: str) -> set:
+    """Aktiv sifarişi olan və ya hazırda başqa sifariş təklifi gözləyən işçilər: onlara yeni təklif göndərilmir."""
+    busy = {r["driver_id"] for r in fetchall(
+        "SELECT driver_id FROM orders WHERE status='accepted' AND kind=? AND driver_id IS NOT NULL", (kind,))}
+    now = time.time()
+    busy |= {r["cur_driver"] for r in fetchall(
+        "SELECT cur_driver FROM orders WHERE status='new' AND kind=? AND cur_driver IS NOT NULL AND offer_until>?",
+        (kind, now))}
+    return busy
+
+
+async def run_offers(bot, oid: int, exclude=()):
+    """Sifarişi yaxından uzağa doğru işçilərə ARDICIL təklif edir: hər birinə OFFER_SECONDS saniyə.
+    Qəbul edən olarsa dayanır; imtina və ya vaxt bitərsə növbətiyə keçir; heç kim qəbul etməsə sifariş 'nodriver' olur."""
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    near = [(km, d) for km, d in nearby_drivers(o["plat"], o["plon"], o["kind"]) if d["user_id"] not in exclude]
-    roads = await road_distances(o["plat"], o["plon"], [d for _, d in near])
-    sent = 0
-    for (_, d), rkm in zip(near, roads):
+    if not o or o["status"] != "new":
+        return
+    token = _runs[oid] = object()                            # yeni axtarış köhnəsini əvəz edir (məs. qəbuldan dərhal sonra imtina)
+    skip = set(exclude) | busy_workers(o["kind"])
+    near = [(km, d) for km, d in nearby_drivers(o["plat"], o["plon"], o["kind"]) if d["user_id"] not in skip]
+    roads = await road_distances(o["plat"], o["plon"], [d for _, d in near]) if near else []
+    cands = sorted(zip(roads, [d for _, d in near]), key=lambda x: x[0])[:MAX_OFFERS]
+    execute("DELETE FROM notifs WHERE order_id=?", (oid,))
+    wlabel = "kuryer" if o["kind"] == "courier" else "sürücü"
+    for rkm, d in cands:
+        o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
+        if _runs.get(oid) is not token or not o or o["status"] != "new":
+            return                                           # müştəri ləğv etdi, başqası qəbul etdi və ya yeni axtarış başladı
+        cur = fetch("SELECT * FROM drivers WHERE user_id=? AND kind=? AND approved=1 AND online=1",
+                    (d["user_id"], o["kind"]))
+        if not cur:
+            continue
+        until = time.time() + OFFER_SECONDS
+        text = order_text(o, rkm) + f"\n\n⏱ {OFFER_SECONDS} saniyə ərzində cavab verin, yoxsa sifariş başqasına keçəcək."
         try:
-            msg = await bot.send_message(d["user_id"], order_text(o, rkm), reply_markup=accept_kb(oid))
-            execute("INSERT INTO notifs(order_id,chat_id,msg_id,driver_id) VALUES(?,?,?,?)",
-                    (oid, d["user_id"], msg.message_id, d["user_id"]))
-            sent += 1
+            msg = await bot.send_message(d["user_id"], text, reply_markup=accept_kb(oid))
         except Exception:
             logging.warning("driver %s bildiriş ala bilmədi (botu başlatmayıb?)", d["user_id"])
-    group_ok = False
-    try:
-        gmsg = await bot.send_message(group_for(o["kind"]), order_text(o), reply_markup=accept_kb(oid))
-        execute("INSERT INTO notifs(order_id,chat_id,msg_id,driver_id) VALUES(?,?,?,NULL)",
-                (oid, group_for(o["kind"]), gmsg.message_id))
-        group_ok = True
-    except Exception as e:
-        logging.error("group send failed: chat_id=%s xəta=%s: %s", group_for(o["kind"]), type(e).__name__, e)
+            continue
+        execute("INSERT INTO notifs(order_id,chat_id,msg_id,driver_id) VALUES(?,?,?,?)",
+                (oid, d["user_id"], msg.message_id, d["user_id"]))
+        execute("UPDATE orders SET cur_driver=?, offer_until=? WHERE id=? AND status='new'", (d["user_id"], until, oid))
+        remind_at = until - OFFER_SECONDS + REMIND_AT if 0 < REMIND_AT < OFFER_SECONDS else None
+        rmsg = None
         try:
-            await bot.send_message(ADMIN_ID, f"⚠️ Sifariş #{oid} qrupa göndərilə bilmədi.\n"
-                                   f"Qrup ID: <code>{group_for(o['kind'])}</code>\nXəta: {esc(type(e).__name__)}: {esc(e)}"[:900])
+            while time.time() < until + 1:                   # +1 s: şəbəkə gecikməsi üçün qısa güzəşt
+                await asyncio.sleep(0.25)
+                o = fetch("SELECT status, cur_driver FROM orders WHERE id=?", (oid,))
+                if _runs.get(oid) is not token or not o or o["status"] != "new" or o["cur_driver"] != d["user_id"]:
+                    break
+                if remind_at and rmsg is None and time.time() >= remind_at:       # ikinci bildiriş səsi
+                    try:
+                        left = max(1, round(until - time.time()))
+                        rmsg = await bot.send_message(d["user_id"], f"⏱ <b>{left} saniyə qalıb!</b> Sifariş #{oid}",
+                                                      reply_markup=accept_kb(oid))
+                    except Exception:
+                        rmsg = False
+        finally:
+            if rmsg:
+                try:
+                    await bot.delete_message(d["user_id"], rmsg.message_id)
+                except Exception:
+                    pass
+        o = fetch("SELECT status, cur_driver FROM orders WHERE id=?", (oid,))
+        if _runs.get(oid) is not token or not o or o["status"] != "new":
+            return
+        if o["cur_driver"] == d["user_id"]:                  # vaxt bitdi: avtomatik imtina
+            execute("UPDATE orders SET cur_driver=NULL WHERE id=? AND cur_driver=?", (oid, d["user_id"]))
+            execute("DELETE FROM notifs WHERE order_id=? AND driver_id=?", (oid, d["user_id"]))
+            try:
+                await bot.edit_message_text(order_text(fetch("SELECT * FROM orders WHERE id=?", (oid,)), rkm)
+                                            + "\n\n⌛ Vaxt bitdi, sifariş başqasına təklif olundu",
+                                            chat_id=d["user_id"], message_id=msg.message_id, reply_markup=None)
+            except Exception:
+                pass
+    if _runs.get(oid) is not token:
+        return
+    _runs.pop(oid, None)
+    n, _ = execute("UPDATE orders SET status='nodriver', cur_driver=NULL WHERE id=? AND status='new'", (oid,))
+    if n:
+        o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
+        try:
+            await bot.send_message(o["customer_id"],
+                                   f"😕 Hazırda sifarişi qəbul edən {wlabel} tapılmadı. Bir az sonra yenidən cəhd edin.",
+                                   reply_markup=with_home())
         except Exception:
             pass
-    return sent, group_ok
+        try:
+            await bot.send_message(ADMIN_ID, f"ℹ️ Sifariş #{oid}: {len(cands)} {wlabel}yə təklif edildi, heç kim qəbul etmədi.")
+        except Exception:
+            pass
 
 
 def cancel_kb(oid: int) -> InlineKeyboardMarkup:
@@ -2005,22 +2191,12 @@ async def dispatch_order(bot, uid: int, uname: str, p: dict):
     )
     if not plabel:
         spawn(fill_pickup_label(oid, p["plat"], p["plon"]))   # alınmayıbsa sonradan tarixçə üçün doldurulur
-    sent, group_ok = await offer_order(bot, oid)
-    if sent == 0 and not group_ok:
-        execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
-        await bot.send_message(uid, "😕 Sifarişi çatdıra bilmədim. Bir az sonra yenidən cəhd edin.",
-                               reply_markup=with_home())
-        return
     cour = p.get("kind") == "courier"
-    parts = []
-    if sent:
-        parts.append(f"{sent} yaxın {'kuryerə' if cour else 'sürücüyə'}")
-    if group_ok:
-        parts.append("kuryerlər qrupuna" if cour else "sürücülər qrupuna")
     await bot.send_message(
-        uid, f"✅ Sifariş #{oid} {' və '.join(parts)} göndərildi. Qəbul edən kimi məlumat gələcək.",
+        uid, f"🔎 Sifariş #{oid} üçün yaxın {'kuryer' if cour else 'sürücü'} axtarılır. Qəbul edən kimi məlumat gələcək.",
         reply_markup=kb_home(cancel_kb(oid)),
     )
+    spawn(run_offers(bot, oid))
 
 
 @router.callback_query(F.data.startswith("cx:"))
@@ -2069,10 +2245,18 @@ async def accept(cb: CallbackQuery):
                else "Siz təsdiqlənmiş deyilsiniz. Botda qeydiyyatdan keçin: /start")
         await cb.answer(msg, show_alert=True)
         return
-    n, _ = execute("UPDATE orders SET status='accepted', driver_id=? WHERE id=? AND status='new'",
-                   (d["user_id"], oid))
+    n, _ = execute("UPDATE orders SET status='accepted', driver_id=?, cur_driver=NULL WHERE id=? AND status='new' "
+                   "AND cur_driver=? AND offer_until>?", (d["user_id"], oid, d["user_id"], time.time() - 1.0))
     if not n:
-        await cb.answer("Bu sifariş artıq götürülüb və ya ləğv edilib.", show_alert=True)
+        cur = fetch("SELECT status FROM orders WHERE id=?", (oid,))
+        if cur and cur["status"] == "new":
+            await cb.answer("Vaxt bitdi, sifariş başqasına təklif olundu.", show_alert=True)
+            try:
+                await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        else:
+            await cb.answer("Bu sifariş artıq götürülüb və ya ləğv edilib.", show_alert=True)
         return
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
 
@@ -2106,7 +2290,9 @@ async def accept(cb: CallbackQuery):
 async def reject(cb: CallbackQuery):
     oid = int(cb.data[4:])
     o = fetch("SELECT * FROM orders WHERE id=?", (oid,))
-    if not is_group_chat(cb.message.chat.id) and o:
+    execute("UPDATE orders SET cur_driver=NULL WHERE id=? AND cur_driver=? AND status='new'", (oid, cb.from_user.id))
+    execute("DELETE FROM notifs WHERE order_id=? AND driver_id=?", (oid, cb.from_user.id))
+    if o:
         try:
             await cb.message.edit_text(order_text(o) + "\n\n❌ İmtina etdiniz", reply_markup=None)
         except Exception:
@@ -2383,14 +2569,9 @@ async def driver_cancel_do(cb: CallbackQuery):
     execute("DELETE FROM notifs WHERE order_id=?", (oid,))
     excl = {r["driver_id"] for r in fetchall(
         "SELECT driver_id FROM order_cancels WHERE order_id=? AND who='driver'", (oid,))}
-    sent, group_ok = await offer_order(cb.bot, oid, exclude=excl)
-    if sent == 0 and not group_ok:
-        await cb.bot.send_message(o["customer_id"], f"😕 {wlabel} imtina etdi, yenisini tapa bilmədim. Yenidən cəhd edin.",
-                                  reply_markup=with_home())
-        execute("UPDATE orders SET status='nodriver' WHERE id=?", (oid,))
-    else:
-        await cb.bot.send_message(o["customer_id"], f"⚠️ {wlabel} imtina etdi. Sizə yenisini axtarırıq…",
-                                  reply_markup=cancel_kb(oid))
+    await cb.bot.send_message(o["customer_id"], f"⚠️ {wlabel} imtina etdi. Sizə yenisini axtarırıq…",
+                              reply_markup=cancel_kb(oid))
+    spawn(run_offers(cb.bot, oid, exclude=excl))
     if cnt >= CANCEL_WARN:
         await cb.bot.send_message(uid, f"⚠️ Son 24 saatda {cnt} dəfə imtina etmisiniz. Çox imtina etmək olmaz.")
         try:
@@ -2724,6 +2905,8 @@ async def admin_decision(cb: CallbackQuery):
         await cb.bot.send_message(uid, note)
     except Exception:
         pass
+    if action == "appr":
+        await send_guide(cb.bot, uid)                  # bildiriş quraşdırma təlimatı (sürücünün dilində)
     await cb.answer()
 
 
@@ -2872,6 +3055,12 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
+    for r in fetchall("SELECT id, customer_id FROM orders WHERE status='new'"):    # bot yenidən başlayıb: axtarışı yarımçıq qalan sifarişlər
+        execute("UPDATE orders SET status='nodriver', cur_driver=NULL WHERE id=?", (r["id"],))
+        try:
+            await bot.send_message(r["customer_id"], f"😕 Sifariş #{r['id']} üzrə axtarış yarımçıq qaldı. Zəhmət olmasa yenidən sifariş verin.")
+        except Exception:
+            pass
     spawn(backup_loop(bot))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
