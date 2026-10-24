@@ -662,14 +662,15 @@ async def geocode(text: str, near=None):
     toks = query_tokens(text)
     own = search_places(toks, near)
     gm = await gomap_search(text, near)
-    if own:  # öz siyahımız həmişə birincidir, ardınca GoMap-in digər uyğun nəticələri (eyni yer təkrarlanmır)
+    if own:  # öz yerləriniz və GoMap nəticələri birlikdə: sifariş verənə ən yaxın olan birinci
         extra = [g for g in gm if not any(dist_km(o["lat"], o["lon"], g["lat"], g["lon"]) < GM_CLUSTER_KM for o in own)]
-        out = own[:5] + extra[:max(0, 5 - len(own[:5]))]
-        if extra:
-            for o in out[:len(own[:5])]:
-                o["score"] = 0.95               # başqa variantlar da var: bir yerə avtomatik getmə, siyahı göstər
-        return _disambiguate(out)
+        for o in own:
+            o["score"] = 0.95 if extra else 1.0     # başqa variantlar da varsa, öz siyahı avtomatik seçilmir
+        pool = own + extra
+        pool.sort(key=lambda c: (c["dist"], c["order"]))
+        return _disambiguate(pool[:5])
     if gm:
+        gm.sort(key=lambda c: (c["dist"], c["order"]))
         return _disambiguate(gm)
     primary = correct_query(text)
     found: dict = {}
@@ -1830,8 +1831,8 @@ async def on_text(m: Message):
             reply_markup=with_home(),
         )
         return
-    best = cands[0]
-    if best["score"] >= 1 and (len(cands) == 1 or cands[1]["score"] < 1):
+    best = max(cands, key=lambda c: c["score"])               # siyahı məsafəyə görə sıralanır, "dəqiq uyğunluq" isə ayrıca işarədir
+    if best["score"] >= 1 and sum(1 for c in cands if c["score"] >= 1) == 1 and all(c["score"] < 0.95 or c is best for c in cands):
         await quote(m, p, best["lat"], best["lon"], best["label"])
         return
     p["cands"] = cands
