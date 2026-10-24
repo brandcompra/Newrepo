@@ -661,9 +661,14 @@ async def geocode(text: str, near=None):
     nəticələrdən ona yaxın olan öndə göstərilir. Nəticə: [{lat, lon, label, score, baku}], ən çoxu 5."""
     toks = query_tokens(text)
     own = search_places(toks, near)
-    if own:  # öz siyahımız həmişə birincidir
-        return own[:5]
     gm = await gomap_search(text, near)
+    if own:  # öz siyahımız həmişə birincidir, ardınca GoMap-in digər uyğun nəticələri (eyni yer təkrarlanmır)
+        extra = [g for g in gm if not any(dist_km(o["lat"], o["lon"], g["lat"], g["lon"]) < GM_CLUSTER_KM for o in own)]
+        out = own[:5] + extra[:max(0, 5 - len(own[:5]))]
+        if extra:
+            for o in out[:len(own[:5])]:
+                o["score"] = 0.95               # başqa variantlar da var: bir yerə avtomatik getmə, siyahı göstər
+        return _disambiguate(out)
     if gm:
         return _disambiguate(gm)
     primary = correct_query(text)
@@ -1834,7 +1839,7 @@ async def on_text(m: Message):
         [InlineKeyboardButton(text=f"{i + 1}. {c.get('btn', c['label'])[:62]}", callback_data=f"g:{i}")]
         for i, c in enumerate(cands)
     ])
-    note = ("Bir neçə uyğun ünvan tapdım." if best["score"] >= 1
+    note = ("Bir neçə uyğun ünvan tapdım." if best["score"] >= 0.9
             else "Dəqiq uyğunluq tapa bilmədim. Bunlardan biri sizin yerinizdir?")
     await m.answer(f"{note}\nSeçin və ya 📎 → Yer ilə xəritədən nöqtə göndərin:", reply_markup=kb)
 
